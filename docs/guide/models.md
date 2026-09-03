@@ -158,7 +158,7 @@ never validated: the server is the authority on what it accepts.
 | `profile` | `openai` if `base_url` is the default, else `generic` | preset for the two knobs below |
 | `max_tokens_field` | per profile | `max_tokens` vs `max_completion_tokens` |
 | `stream_usage` | per profile | send `stream_options.include_usage` |
-| `capture_extras` | `false` | persist and replay non-standard per-tool extension fields (for example Gemini thought signatures in `extra_content` or LiteLLM `provider_specific_fields`); also retain message-level provider fields for inspection |
+| `capture_extras` | `false` | persist and replay non-standard per-tool extension fields (for example Gemini thought signatures in `extra_content` or LiteLLM `provider_specific_fields`); also retain message-level `provider_specific_fields` and `extra_content` for inspection |
 | `max_tokens` | 65536 | output cap. Accepted by **every** provider (handled centrally), and written into whichever field the profile selects — so it can no longer collide with `max_completion_tokens` |
 
 ### Profiles

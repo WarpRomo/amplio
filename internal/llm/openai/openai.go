@@ -45,6 +45,7 @@ const sseMaxLine = 4 << 20
 
 const (
 	providerSpecificFieldsKey = "openai.provider_specific_fields"
+	messageExtraContentKey    = "openai.extra_content"
 	toolCallExtraFieldsKey    = "openai.tool_call_extra_fields"
 )
 
@@ -645,6 +646,11 @@ func (p *provider) Call(ctx context.Context, req llm.Request) (*llm.Response, er
 		if len(ch.Message.ProviderSpecificFields) > 0 {
 			if blob, err := json.Marshal(ch.Message.ProviderSpecificFields); err == nil {
 				extra[providerSpecificFieldsKey] = string(blob)
+			}
+		}
+		if len(ch.Message.ExtraContent) > 0 {
+			if blob, err := json.Marshal(ch.Message.ExtraContent); err == nil {
+				extra[messageExtraContentKey] = string(blob)
 			}
 		}
 		if blob, ok := encodeToolCallExtraFields(ch.Message.ToolCalls); ok {

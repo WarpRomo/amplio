@@ -843,3 +843,64 @@ func TestStream_NonSSEResponseIsAnError(t *testing.T) {
 		t.Fatalf("err = %v, want a clear non-SSE error", err)
 	}
 }
+
+func TestCall_CapturesMessageExtraContent(t *testing.T) {
+	srv, _ := serveJSON(t, 200, `{"choices":[{"message":{"content":"ok","provider_specific_fields":{"trace_id":"trace-1"},"extra_content":{"provider":{"opaque":"message-extra"}}}}]}`)
+	resp, err := newProvider(t, srv.URL, "capture_extras", "true").Call(context.Background(), llm.Request{})
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if resp.ProviderExtra == nil {
+		t.Fatal("ProviderExtra = nil, want captured message-level metadata")
+	}
+	if _, ok := resp.ProviderExtra[providerSpecificFieldsKey]; !ok {
+		t.Fatalf("message-level provider_specific_fields missing: %+v", resp.ProviderExtra)
+	}
+	raw, ok := resp.ProviderExtra[messageExtraContentKey].(string)
+	if !ok || raw == "" {
+		t.Fatalf("message-level extra_content missing: %+v", resp.ProviderExtra)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatal(err)
+	}
+	var provider map[string]string
+	if err := json.Unmarshal(got["provider"], &provider); err != nil {
+		t.Fatal(err)
+	}
+	if provider["opaque"] != "message-extra" {
+		t.Fatalf("message extra_content = %#v, want opaque=message-extra", provider)
+	}
+}
+
+func TestStream_CapturesMessageExtraContent(t *testing.T) {
+	const body = `data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"","provider_specific_fields":{"trace_id":"trace-stream"},"extra_content":{"provider":{"opaque":"stream-extra"}}}}]}
+
+data: [DONE]
+
+`
+	srv, _ := serveSSE(t, body)
+	resp := drain(t, mustStream(t, newProvider(t, srv.URL, "capture_extras", "true")))
+
+	if resp.ProviderExtra == nil {
+		t.Fatal("ProviderExtra = nil, want captured message-level metadata")
+	}
+	if _, ok := resp.ProviderExtra[providerSpecificFieldsKey]; !ok {
+		t.Fatalf("stream message-level provider_specific_fields missing: %+v", resp.ProviderExtra)
+	}
+	raw, ok := resp.ProviderExtra[messageExtraContentKey].(string)
+	if !ok || raw == "" {
+		t.Fatalf("stream message-level extra_content missing: %+v", resp.ProviderExtra)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatal(err)
+	}
+	var provider map[string]string
+	if err := json.Unmarshal(got["provider"], &provider); err != nil {
+		t.Fatal(err)
+	}
+	if provider["opaque"] != "stream-extra" {
+		t.Fatalf("stream message extra_content = %#v, want opaque=stream-extra", provider)
+	}
+}
