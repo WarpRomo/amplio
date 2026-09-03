@@ -41,10 +41,21 @@
 		CaretRightIcon,
 		CheckCircleIcon,
 		WarningCircleIcon,
-		ProhibitIcon
+		ProhibitIcon,
+		TranslateIcon
 	} from 'phosphor-svelte';
 	import { iconForName } from '$lib/sessionIcon';
 	import { toolIcon } from '$lib/toolIcon';
+
+	/* Conclusion rewrites (see internal/responserewrite): a plain-prose
+	   restatement served alongside the original in the chat feed. Opt-in per
+	   model in config, so a session either has them or does not; the per-message
+	   toggle below is the reader's escape, deliberately not persisted. */
+
+	// Per-message override: absent = show the rewrite (the operator opted in and
+	// expects it), true = this reader asked for the agent's own words.
+	let showOriginal = $state<Record<number, boolean>>({});
+
 
 	let {
 		runId,
@@ -224,16 +235,50 @@
 				toolCalls: ChatToolCall[],
 				streaming: boolean,
 				step: number,
-				eid: string = ''
+				eid: string = '',
+				rewriteText: string = ''
 			)}
 				<!-- data-eid is the navigator's scroll target: it resolves a segment to a
 				     DOM node without the navigator knowing anything about this markup. -->
+				{@const rewrite = streaming ? '' : rewriteText}
+				{@const showRewrite = !!rewrite && !showOriginal[step]}
+				{@const shown = showRewrite ? (rewrite as string) : content}
 				<div class="asst-inline" data-eid={eid}>
 					{#if content && !streaming}
-						<span class="asst-copy"><CopyButton text={content} /></span>
+						<span class="asst-copy"><CopyButton text={shown} /></span>
 					{/if}
-					{#if thoughts}<Thoughts {thoughts} {streaming} />{/if}
-					{#if content}<div class="md">{@html renderMarkdown(content, { linkifyArtifacts: true })}</div>{/if}
+					<!-- The marker lives on an INNER box: .asst-inline carries the copy
+					     button at right:100%, so shifting its edges moves the button. -->
+					<div class="rw-box" class:rwbubble={!!rewrite}>
+						{#if rewrite}
+							<!-- Persistent, not hover-only: someone quoting this text elsewhere
+							     must be able to see whose words they are. The glyph sits inside
+							     the rewrite pill, where it labels the option rather than the
+							     whole message — the row is also shown while reading the
+							     original. -->
+							<div class="rw-bar">
+								<span class="rw-seg">
+									<button
+										class:on={showRewrite}
+										aria-pressed={showRewrite}
+										onclick={() => (showOriginal[step] = false)}
+									>
+										<TranslateIcon size={11} weight="bold" />
+										rewrite
+									</button>
+									<button
+										class:on={!showRewrite}
+										aria-pressed={!showRewrite}
+										onclick={() => (showOriginal[step] = true)}
+									>
+										original
+									</button>
+								</span>
+							</div>
+						{/if}
+						{#if thoughts}<Thoughts {thoughts} {streaming} />{/if}
+						{#if content}<div class="md">{@html renderMarkdown(shown, { linkifyArtifacts: true })}</div>{/if}
+					</div>
 					{#if streaming}<span class="cursor"></span>{/if}
 					{#if toolCalls.length}
 						<div class="tools">
@@ -353,7 +398,7 @@
 						<div class="md dim small compaction-body">{@html renderMarkdown(m.content)}</div>
 					</details>
 				{:else}
-					{@render chatbotInline(m.content, m.thoughts ?? '', m.tool_calls, false, m.step, m.event_id)}
+					{@render chatbotInline(m.content, m.thoughts ?? '', m.tool_calls, false, m.step, m.event_id, m.rewrite ?? '')}
 				{/if}
 
 				{#if row.showSep || row.reserved}
@@ -419,6 +464,55 @@
 	{/if}
 </dialog>
 <style>
+	/* NOT `.bubble`: that class already exists for operator messages and carries
+	   max-width:80%, which silently cut this box to 640px of an 806px column. */
+	.rw-box.rwbubble {
+		/* Same padding and radius as the operator .bubble, so the two kinds of
+		   bubble are the same object wearing different borders; only the dash and
+		   the label differ. No negative margins: .asst-inline already ends on the
+		   same right edge as an operator bubble, and overhanging it by 6px was the
+		   misalignment. */
+		border: 1px dashed var(--border);
+		border-radius: var(--radius-lg);
+		padding: 0.5rem 0.75rem;
+		/* Cancel .asst-inline's own 0.2rem side padding, and only that, so the
+		   border lands on exactly the same right edge as an operator bubble. */
+		margin: 0 -0.2rem;
+		background: color-mix(in srgb, var(--bg-elev) 55%, transparent);
+	}
+	.rw-bar {
+		display: flex;
+		align-items: center;
+		gap: 0.35rem;
+		font-size: var(--fs-xs);
+		color: var(--text-dim);
+		margin-bottom: 0.3rem;
+	}
+	.rw-seg {
+		display: inline-flex;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-pill);
+		overflow: hidden;
+		margin-left: 0.2rem;
+	}
+	.rw-seg button {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.25rem;
+		background: transparent;
+		border: 0;
+		padding: 0.05rem 0.45rem;
+		font-size: var(--fs-xs);
+		color: var(--text-dim);
+		cursor: pointer;
+	}
+	.rw-seg button:hover:not(.on) {
+		color: var(--text);
+	}
+	.rw-seg button.on {
+		background: var(--bg-elev2);
+		color: var(--text);
+	}
 	.pending {
 		opacity: 0.55;
 	}

@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"amplio/internal/agent/critic"
 	"amplio/internal/briefing"
@@ -29,6 +30,7 @@ import (
 	"amplio/internal/llm"
 	bridgeprovider "amplio/internal/llm/bridge"
 	"amplio/internal/observer"
+	"amplio/internal/responserewrite"
 	"amplio/internal/runtime"
 	"amplio/internal/skills"
 )
@@ -68,6 +70,10 @@ type system struct {
 type systemOpts struct {
 	broadcaster eventstream.Broadcaster
 	liveReports bool
+	// rewriteNotify tells the UI a conclusion rewrite has landed. A rewrite is
+	// stored outside the event log, so nothing else would bump the page. nil in
+	// the headless modes, which have no page to bump.
+	rewriteNotify func(runID, sessionID string)
 }
 
 // setupSystem performs the shared, run-independent bootstrap and returns the
@@ -100,7 +106,17 @@ func setupSystem(ctx context.Context, cfg config.Config, opts systemOpts) (*syst
 	// selection a run stores is resolved against whatever is loaded here.
 	briefing.LoadDir(config.BriefingsDir())
 
-	mgr := buildManager(store)
+	// Conclusion rewriting: opt-in per model, off unless [response_rewrite].for
+	// names one. Composed onto the commit listener as a fire-and-forget observer
+	// — a rewrite is best-effort content, never part of the wake path.
+	var extra []db.CommitListener
+	if len(cfg.ResponseRewrite.For) > 0 {
+		rw := responserewrite.New(cfg.ResponseRewrite, store, createProvider, opts.rewriteNotify)
+		extra = append(extra, rw.Observe)
+		slog.Info("response rewrite enabled", "model", cfg.ResponseRewrite.Model,
+			"for", cfg.ResponseRewrite.For)
+	}
+	mgr := buildManager(store, extra...)
 	mgr.SetSystemProviders(systemFast, systemHQ)
 	bindCLITools(cfg)
 	if opts.broadcaster != nil {

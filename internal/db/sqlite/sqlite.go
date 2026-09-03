@@ -787,6 +787,7 @@ func (s *sqliteStore) TerminateAndNotifyParent(ctx context.Context, runID, sessi
 			); err != nil {
 				return fmt.Errorf("insert child result: %w", err)
 			}
+			setEventStep(evt, pStep)
 			notifyEvt = evt
 		}
 
@@ -859,6 +860,7 @@ func (s *sqliteStore) AppendEvent(ctx context.Context, runID, sessionID string, 
 		return "", fmt.Errorf("marshal event: %w", err)
 	}
 	eventID := db.NewEventID()
+	committedStep := 0
 
 	if err := func() error {
 		s.mu.Lock()
@@ -882,6 +884,7 @@ func (s *sqliteStore) AppendEvent(ctx context.Context, runID, sessionID string, 
 		).Scan(&step, &gen); err != nil {
 			return fmt.Errorf("read session step: %w", err)
 		}
+		committedStep = step
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO Event (run_id, session_id, event_id, step, generation, data)
 			 VALUES (?, ?, ?, ?, ?, ?)`,
@@ -897,6 +900,7 @@ func (s *sqliteStore) AppendEvent(ctx context.Context, runID, sessionID string, 
 	}(); err != nil {
 		return "", err
 	}
+	setEventStep(evt, committedStep)
 	s.fireCommit(runID, sessionID, evt)
 	return eventID, nil
 }
@@ -941,6 +945,7 @@ func (s *sqliteStore) AppendEventAtStep(ctx context.Context, runID, sessionID st
 	}(); err != nil {
 		return err
 	}
+	setEventStep(evt, step)
 	s.fireCommit(runID, sessionID, evt)
 	return nil
 }
@@ -1004,6 +1009,7 @@ func (s *sqliteStore) FinalizeStep(ctx context.Context, runID, sessionID string,
 	}
 
 	for _, r := range rows {
+		setEventStep(r.evt, step)
 		s.fireCommit(runID, sessionID, r.evt)
 	}
 	s.fireStepFinalized(runID, sessionID, step)
@@ -1400,25 +1406,47 @@ func scanEvents(rows *sql.Rows) ([]db.EventRecord, error) {
 }
 
 func setColumnFields(evt event.Event, step, gen int, createdAt time.Time) {
-	cf := event.ColumnFields{Step: step, Generation: gen, CreatedAt: createdAt}
+	if cf := columnFields(evt); cf != nil {
+		*cf = event.ColumnFields{Step: step, Generation: gen, CreatedAt: createdAt}
+	}
+}
+
+// setEventStep stamps the step an event was just committed at, so a commit
+// listener sees the same Step a reader would. The read path injects the column
+// fields on the way out (setColumnFields); the write path left them zero, which
+// silently told every listener the event was at step 0.
+//
+// Only the step. Generation is a context epoch that compaction rewrites in
+// place on rows that already exist, so a value stamped at write time goes stale
+// the moment the session compacts — nothing downstream should key on it.
+func setEventStep(evt event.Event, step int) {
+	if cf := columnFields(evt); cf != nil {
+		cf.Step = step
+	}
+}
+
+// columnFields returns a pointer to an event's embedded ColumnFields, or nil
+// for an event type that carries none.
+func columnFields(evt event.Event) *event.ColumnFields {
 	switch e := evt.(type) {
 	case *event.SystemEvent:
-		e.ColumnFields = cf
+		return &e.ColumnFields
 	case *event.UserEvent:
-		e.ColumnFields = cf
+		return &e.ColumnFields
 	case *event.AssistantEvent:
-		e.ColumnFields = cf
+		return &e.ColumnFields
 	case *event.ToolResultEvent:
-		e.ColumnFields = cf
+		return &e.ColumnFields
 	case *event.CompactionEvent:
-		e.ColumnFields = cf
+		return &e.ColumnFields
 	case *event.MessageEvent:
-		e.ColumnFields = cf
+		return &e.ColumnFields
 	case *event.ChildResultEvent:
-		e.ColumnFields = cf
+		return &e.ColumnFields
 	case *event.RecoverEvent:
-		e.ColumnFields = cf
+		return &e.ColumnFields
 	}
+	return nil
 }
 
 // --- Observation operations ---
@@ -1663,6 +1691,42 @@ func (s *sqliteStore) ListCustomModels(ctx context.Context) ([]string, error) {
 		specs = append(specs, spec)
 	}
 	return specs, rows.Err()
+}
+
+func (s *sqliteStore) PutResponseRewrite(ctx context.Context, rw db.ResponseRewriteRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.sqlDB.ExecContext(ctx,
+		`INSERT INTO ResponseRewrite (run_id, session_id, step, model, text, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(run_id, session_id, step)
+		 DO UPDATE SET model=excluded.model, text=excluded.text, created_at=excluded.created_at`,
+		rw.RunID, rw.SessionID, rw.Step, rw.Model, rw.Text, formatTime(time.Now()))
+	if err != nil {
+		return fmt.Errorf("put response rewrite: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) ListResponseRewrites(ctx context.Context, runID, sessionID string) (map[int]db.ResponseRewriteRecord, error) {
+	rows, err := s.sqlDB.QueryContext(ctx,
+		`SELECT step, model, text, created_at FROM ResponseRewrite
+		 WHERE run_id = ? AND session_id = ?`, runID, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("list response rewrites: %w", err)
+	}
+	defer rows.Close()
+	out := map[int]db.ResponseRewriteRecord{}
+	for rows.Next() {
+		rw := db.ResponseRewriteRecord{RunID: runID, SessionID: sessionID}
+		var created string
+		if err := rows.Scan(&rw.Step, &rw.Model, &rw.Text, &created); err != nil {
+			return nil, fmt.Errorf("scan response rewrite: %w", err)
+		}
+		rw.CreatedAt = parseTime(created)
+		out[rw.Step] = rw
+	}
+	return out, rows.Err()
 }
 
 func (s *sqliteStore) AddCustomModel(ctx context.Context, spec string) error {

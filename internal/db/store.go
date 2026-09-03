@@ -75,6 +75,12 @@ type Store interface {
 	RunCounts(ctx context.Context) (RunCounts, error)
 
 	// --- Custom model menu (user-added models; the app-owned half of the menu) ---
+	// PutResponseRewrite stores (or replaces) the plain-prose restatement of one
+	// conclusion message; ListResponseRewrites returns them by step for a
+	// session. Best-effort content: callers show the original when absent.
+	PutResponseRewrite(ctx context.Context, rw ResponseRewriteRecord) error
+	ListResponseRewrites(ctx context.Context, runID, sessionID string) (map[int]ResponseRewriteRecord, error)
+
 	ListCustomModels(ctx context.Context) ([]string, error)
 	AddCustomModel(ctx context.Context, spec string) error
 	RemoveCustomModel(ctx context.Context, spec string) error
@@ -252,6 +258,11 @@ type Store interface {
 // CommitListener is invoked synchronously after an event append commits, with
 // the appended event. It must not block and must not call back into the store
 // in a way that re-enters the append path on the same goroutine.
+//
+// The event carries the step it was committed at (event.ColumnFields.Step),
+// stamped by the store — the caller that built the event does not set it.
+// Generation is NOT stamped: it is a context epoch that compaction rewrites in
+// place, so it would be stale as soon as the session compacts.
 type CommitListener func(runID, sessionID string, evt event.Event)
 
 // StepFinalizedListener is invoked after a step is finalized. It must not block

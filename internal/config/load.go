@@ -21,6 +21,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -49,8 +51,13 @@ type Config struct {
 	LendLLM string `toml:"lend_llm"`
 	// LendLLMTokenEnv names the variable holding the bearer token the lending
 	// listener requires. Its own secret.
-	LendLLMTokenEnv string       `toml:"lend_llm_token_env"`
-	Skills          SkillsConfig `toml:"skills"` // skill corpus sources
+	LendLLMTokenEnv string        `toml:"lend_llm_token_env"`
+	Skills          SkillsConfig  `toml:"skills"`  // skill corpus sources
+	Lessons         LessonsConfig `toml:"lessons"` // lesson corpus policy
+	// ResponseRewrite optionally restates a chatbot's conclusion messages in
+	// plainer prose, shown alongside the original in the UI. Opt-in per model:
+	// an empty For list (or an absent block) disables it entirely.
+	ResponseRewrite ResponseRewrite `toml:"response_rewrite"`
 	// AmplioBinPaths are directories prepended to $PATH at startup so amplio's
 	// shipped 1p CLI tools (e.g. web_search) resolve by bare name for both our
 	// probes and the agent's bash subprocesses. Omitted → the built-in default;
@@ -60,6 +67,27 @@ type Config struct {
 
 // BridgeEndpoint is one [bridge.<name>] section: how to reach a bridge. What to
 // ASK IT FOR stays in the spec — this table is only ever about the link.
+// ResponseRewrite configures the conclusion-message rewriter.
+//
+// Opt-in is per MODEL rather than per run or globally: whether a plainer
+// restatement helps depends on who writes the original, and an operator who
+// picks a model is the one who knows. For lists the models whose runs get it.
+type ResponseRewrite struct {
+	// Model is the spec that does the rewriting. Required when For is non-empty:
+	// a rewrite the operator did not choose the model for is worse than a config
+	// error, so this fails at startup rather than defaulting to a system tier.
+	Model string `toml:"model"`
+	// For names the RUN models that opt in. An entry matches a run whose spec is
+	// equal to it, or whose nickname or short label is — the same three ways a
+	// bridge handle names a model, so "opus-5 · xhigh" works and there is no
+	// second naming scheme to learn. No wildcards.
+	For []string `toml:"for"`
+	// Prompt replaces the built-in rewrite prompt wholesale. Plain text, no
+	// templating: it becomes the system prompt, and the message being rewritten
+	// is the only user turn.
+	Prompt string `toml:"prompt"`
+}
+
 type BridgeEndpoint struct {
 	URL         string `toml:"url"`          // https://host:port, http://…, or unix:///path
 	TokenEnv    string `toml:"token_env"`    // variable holding the bearer token
@@ -73,6 +101,21 @@ type SkillsConfig struct {
 	// → skills disabled. See Config.SkillDirs.
 	Dirs    []string `toml:"dirs"`
 	Blocked []string `toml:"blocked"` // skill names to exclude from all sources
+}
+
+// LessonsConfig is the [lessons] section: what an instance may do with the
+// lessons mined from past runs.
+type LessonsConfig struct {
+	// Search enables the AGENT-FACING lesson corpus: recall_search over
+	// lessons, recall_load of a lesson: handle, and the run-start seed.
+	// Omitted (nil) → enabled. Setting it false gives a controlled run full
+	// isolation from what other runs learned, while end-of-run mining, lesson
+	// scoring, and the operator's /recall page keep working — this instance
+	// still CONTRIBUTES lessons, it just doesn't READ them.
+	//
+	// A pointer so an absent key is distinguishable from an explicit false: a
+	// plain bool would make every zero-valued Config silently mean "off".
+	Search *bool `toml:"search"`
 }
 
 // DefaultSkillsDir is the fallback when [skills].dirs is omitted from
@@ -113,6 +156,12 @@ func (c Config) SkillDirs() []string {
 		return []string{DefaultSkillsDir}
 	}
 	return c.Skills.Dirs
+}
+
+// LessonSearchEnabled reports whether agents may search the lesson corpus.
+// Default (key absent) is enabled.
+func (c Config) LessonSearchEnabled() bool {
+	return c.Lessons.Search == nil || *c.Lessons.Search
 }
 
 // EmbedModelOrDefault returns the configured embedding model, or the built-in
@@ -200,6 +249,7 @@ type Overrides struct {
 	EmbedModel    string
 	SkillDirs     []string
 	SkillDirsSet  bool
+	LessonSearch  *bool // nil = --lesson-search not passed
 }
 
 // Resolve loads <dataDir>/config.toml and overlays the flag/env layers on top,
@@ -220,6 +270,23 @@ func Resolve(dataDir string, o Overrides) (Config, error) {
 	cfg.SystemLLMFast = firstNonEmpty(o.SystemLLMFast, os.Getenv(EnvSystemLLMFast), cfg.SystemLLMFast)
 	cfg.EmbedModel = firstNonEmpty(o.EmbedModel, os.Getenv(EnvEmbedModel), cfg.EmbedModel)
 
+	// Lesson search (tri-state bool): an explicit flag wins, then the env var,
+	// then the config key, then the default (enabled). An unparseable env value
+	// is an ERROR rather than a fallback — this switch exists to guarantee an
+	// isolated run, and silently re-enabling recall because of a typo would
+	// contaminate exactly the experiment it was set for.
+	if o.LessonSearch != nil {
+		cfg.Lessons.Search = o.LessonSearch
+	} else if raw := strings.TrimSpace(os.Getenv(EnvLessonSearch)); raw != "" {
+		// Empty reads as unset, like every other env layer here: an exported-but-
+		// empty variable is a shell artefact, not an instruction.
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s=%q: want a boolean (1/0, true/false)", EnvLessonSearch, raw)
+		}
+		cfg.Lessons.Search = &v
+	}
+
 	// Skill dirs (list, REPLACE semantics): the highest layer that is SET wins
 	// wholesale. flag-set (SkillDirsSet) > env-set (LookupEnv) > config (handled
 	// by SkillDirs()/the [skills].dirs nil-vs-empty distinction).
@@ -239,6 +306,15 @@ func Resolve(dataDir string, o Overrides) (Config, error) {
 	}
 	if cfg.SystemLLMFast == "" {
 		return Config{}, requiredErr("--system-llm-fast", EnvSystemLLMFast, "system_llm_fast")
+	}
+	// Fail fast rather than falling back to a system tier: the rewrite is shown
+	// to the operator as the agent's own words restated, so which model produced
+	// it is a choice, not a default.
+	if len(cfg.ResponseRewrite.For) > 0 && cfg.ResponseRewrite.Model == "" {
+		return Config{}, fmt.Errorf(
+			"[response_rewrite] lists %d model(s) in `for` but sets no `model`: "+
+				"name the spec that should do the rewriting, or remove `for` to disable it",
+			len(cfg.ResponseRewrite.For))
 	}
 	return cfg, nil
 }

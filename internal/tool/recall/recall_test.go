@@ -148,3 +148,75 @@ func TestRecallInitialContent(t *testing.T) {
 		t.Fatalf("empty task should yield no initial content, got %q", c)
 	}
 }
+
+// The instance-wide isolation switch: no lesson reaches an agent through any of
+// the three surfaces, while the index itself still answers — that is what
+// end-of-run mining, its near-duplicate check, lesson scoring and the
+// operator's /recall page run on, and they must keep working.
+func TestLessonSearchDisabled(t *testing.T) {
+	skillIx, lessonIx, _ := buildIndexes(t)
+	ctx := context.Background()
+	lessonIx.DisableRecall()
+
+	// 1. recall_search: skills still hit, the lesson never does.
+	res, err := Search(skillIx, lessonIx).Execute(ctx, json.RawMessage(`{"query":"flaky build retry"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Content, "lesson:abc123") || strings.Contains(res.Content, "Lessons (mined") {
+		t.Errorf("lesson leaked into search: %s", res.Content)
+	}
+	res, err = Search(skillIx, lessonIx).Execute(ctx, json.RawMessage(`{"query":"query spanner sql"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Content, "skill:spanner") {
+		t.Errorf("skills must still be searchable: %s", res.Content)
+	}
+
+	// 2. The tool description must not advertise a corpus it will never return.
+	if d := Search(skillIx, lessonIx).Description; strings.Contains(d, "lessons") {
+		t.Errorf("description still promises lessons: %s", d)
+	}
+
+	// 3. recall_load of a lesson handle is refused, and says why (a bare
+	// "unavailable" reads as a transient fault worth retrying).
+	res, err = Load(skillIx, lessonIx).Execute(ctx, json.RawMessage(`{"handle":"lesson:abc123"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(res.Content, "disabled") {
+		t.Errorf("lesson load = %q (error=%v), want a refusal naming the switch", res.Content, res.IsError)
+	}
+	if strings.Contains(res.Content, "rerun with") {
+		t.Errorf("lesson body leaked through recall_load: %s", res.Content)
+	}
+	// Skills load as usual.
+	res, err = Load(skillIx, lessonIx).Execute(ctx, json.RawMessage(`{"handle":"skill:spanner"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Content, "# Skill: spanner") {
+		t.Errorf("skill load broke: %s", res.Content)
+	}
+
+	// 4. The run-start seed carries skills only.
+	if c := InitialContent(ctx, skillIx, lessonIx, "flaky build retry"); strings.Contains(c, "lesson:abc123") {
+		t.Errorf("lesson leaked into the initial recall seed: %s", c)
+	}
+	if c := InitialContent(ctx, skillIx, lessonIx, "query spanner sql"); !strings.Contains(c, "skill:spanner") {
+		t.Errorf("skills must still seed: %s", c)
+	}
+
+	// 5. Mining/scoring/UI path: the index itself is untouched.
+	hits, err := lessonIx.Search(ctx, "flaky build retry", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 {
+		t.Error("the index stopped answering — mining, dedup and scoring depend on it")
+	}
+	if !lessonIx.IsBuilt() {
+		t.Error("index reports not built")
+	}
+}
