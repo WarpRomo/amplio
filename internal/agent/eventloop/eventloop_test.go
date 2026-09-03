@@ -16,6 +16,7 @@ package eventloop
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1632,5 +1633,114 @@ func TestBootstrap_NewSessionMarkerCarriesAncestry(t *testing.T) {
 	}
 	if strings.Index(got, "main-agent") > strings.Index(got, "silver-seal") {
 		t.Errorf("chain is not root-first: %q", got)
+	}
+}
+
+// Tool results are appended in COMPLETION order (tools run in parallel), so the
+// projection has to put them back in CALL order: gemini-2.5-* issue no
+// function-call id, which makes their binding of result→call positional, and a
+// swapped pair is read as each other's answer with no error anywhere.
+func TestOrderToolResults(t *testing.T) {
+	asst := func(ids ...string) llm.Message {
+		m := llm.Message{Role: llm.RoleAssistant, Content: "working"}
+		for _, id := range ids {
+			m.ToolCalls = append(m.ToolCalls, llm.ToolCall{ID: id, Name: "bash"})
+		}
+		return m
+	}
+	res := func(id string) llm.Message {
+		return llm.Message{Role: llm.RoleToolResult, ToolCallID: id, Content: "out:" + id}
+	}
+	// ids of the tool-result run, in order, for comparison.
+	ids := func(msgs []llm.Message) []string {
+		var out []string
+		for _, m := range msgs {
+			if m.Role == llm.RoleToolResult {
+				out = append(out, m.ToolCallID)
+			}
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name string
+		in   []llm.Message
+		want []string
+	}{
+		{"reversed pair", []llm.Message{asst("a", "b"), res("b"), res("a")}, []string{"a", "b"}},
+		{"already in order", []llm.Message{asst("a", "b"), res("a"), res("b")}, []string{"a", "b"}},
+		{"scrambled three", []llm.Message{asst("a", "b", "c"), res("c"), res("a"), res("b")},
+			[]string{"a", "b", "c"}},
+		{"unmatched id keeps its content and goes last",
+			[]llm.Message{asst("a", "b"), res("zz"), res("b"), res("a")}, []string{"a", "b", "zz"}},
+		{"a missing result is not invented",
+			[]llm.Message{asst("a", "b", "c"), res("c"), res("a")}, []string{"a", "c"}},
+		{"results not answering a call are left alone",
+			[]llm.Message{{Role: llm.RoleUser, Content: "hi"}, res("b"), res("a")}, []string{"b", "a"}},
+		{"single call is untouched", []llm.Message{asst("a"), res("a")}, []string{"a"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs := append([]llm.Message(nil), tc.in...)
+			orderToolResults(msgs)
+			if got := ids(msgs); !slices.Equal(got, tc.want) {
+				t.Errorf("tool result order = %v, want %v", got, tc.want)
+			}
+			// Nothing may be dropped, duplicated, or re-tagged.
+			if len(msgs) != len(tc.in) {
+				t.Fatalf("message count = %d, want %d", len(msgs), len(tc.in))
+			}
+			for _, m := range msgs {
+				if m.Role == llm.RoleToolResult && m.Content != "out:"+m.ToolCallID {
+					t.Errorf("result %q carries %q — content was separated from its id",
+						m.ToolCallID, m.Content)
+				}
+			}
+		})
+	}
+}
+
+// Two runs of results, back to back, each ordered against its OWN turn — the
+// pass must not merge them or reorder across the assistant turn between.
+func TestOrderToolResults_TwoTurns(t *testing.T) {
+	msgs := []llm.Message{
+		{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{{ID: "a"}, {ID: "b"}}},
+		{Role: llm.RoleToolResult, ToolCallID: "b"},
+		{Role: llm.RoleToolResult, ToolCallID: "a"},
+		{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{{ID: "c"}, {ID: "d"}}},
+		{Role: llm.RoleToolResult, ToolCallID: "d"},
+		{Role: llm.RoleToolResult, ToolCallID: "c"},
+	}
+	orderToolResults(msgs)
+	var got []string
+	for _, m := range msgs {
+		if m.Role == llm.RoleToolResult {
+			got = append(got, m.ToolCallID)
+		}
+	}
+	if want := []string{"a", "b", "c", "d"}; !slices.Equal(got, want) {
+		t.Errorf("order = %v, want %v", got, want)
+	}
+}
+
+// End to end through the projection, from events in the order the store really
+// holds them: the second tool finished first.
+func TestBuildMessages_ToolResultsFollowCallOrder(t *testing.T) {
+	a := &EventLoopAgent{}
+	recs := []db.EventRecord{
+		{Event: &event.UserEvent{Content: "task"}},
+		{Event: &event.AssistantEvent{Content: "two things", ToolCalls: []event.ToolCall{
+			{ID: "slow", Name: "bash"}, {ID: "fast", Name: "bash"}}}},
+		{Event: &event.ToolResultEvent{ToolCallID: "fast", Content: "quick"}},
+		{Event: &event.ToolResultEvent{ToolCallID: "slow", Content: "eventually"}},
+	}
+	_, messages := a.buildMessages(recs)
+	if len(messages) != 4 {
+		t.Fatalf("messages = %d, want 4", len(messages))
+	}
+	if messages[2].ToolCallID != "slow" || messages[3].ToolCallID != "fast" {
+		t.Errorf("results replayed as [%s %s], want [slow fast] — the order the calls were made in",
+			messages[2].ToolCallID, messages[3].ToolCallID)
+	}
+	if messages[2].Content != "eventually" || messages[3].Content != "quick" {
+		t.Errorf("content followed the wrong id: %q / %q", messages[2].Content, messages[3].Content)
 	}
 }

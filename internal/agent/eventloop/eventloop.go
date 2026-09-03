@@ -887,7 +887,50 @@ func (a *EventLoopAgent) buildMessages(events []db.EventRecord) (systemPrompt st
 		leading = false // first non-system message ends the leading cluster
 		messages = append(messages, *msg)
 	}
+	orderToolResults(messages)
 	return strings.Join(sys, "\n\n"), messages
+}
+
+// orderToolResults puts each run of tool-result messages back into the order
+// the tool calls were made, in place.
+//
+// Tools run in parallel and each result is appended the moment its tool
+// finishes, so the event log holds them in COMPLETION order. That is deliberate on
+// the write side, so the ordering is restored here, at projection time, where it is the
+// wire format's problem rather than the log's.
+//
+// Results whose id matches no call in the preceding assistant turn keep their
+// relative order and follow the matched ones, so nothing is dropped, added or
+// silently reinterpreted.
+func orderToolResults(msgs []llm.Message) {
+	for i := 0; i < len(msgs); i++ {
+		calls := msgs[i].ToolCalls
+		if msgs[i].Role != llm.RoleAssistant || len(calls) < 2 {
+			continue
+		}
+		end := i + 1
+		for end < len(msgs) && msgs[end].Role == llm.RoleToolResult {
+			end++
+		}
+		run := msgs[i+1 : end]
+		i = end - 1
+		if len(run) < 2 {
+			continue
+		}
+		pos := make(map[string]int, len(calls))
+		for j, tc := range calls {
+			if _, dup := pos[tc.ID]; !dup {
+				pos[tc.ID] = j // a repeated id keeps its first position
+			}
+		}
+		rank := func(m llm.Message) int {
+			if j, ok := pos[m.ToolCallID]; ok {
+				return j
+			}
+			return len(calls) // unmatched: after everything the turn asked for
+		}
+		sort.SliceStable(run, func(a, b int) bool { return rank(run[a]) < rank(run[b]) })
+	}
 }
 
 func (a *EventLoopAgent) eventToMessage(evt event.Event) *llm.Message {

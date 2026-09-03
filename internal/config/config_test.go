@@ -46,7 +46,7 @@ func TestDataDir_Override(t *testing.T) {
 // clean slate regardless of the ambient environment.
 func clearLayerEnv(t *testing.T) {
 	t.Helper()
-	for _, e := range []string{EnvSystemLLMHQ, EnvSystemLLMFast, EnvEmbedModel, EnvSkillDirs} {
+	for _, e := range []string{EnvSystemLLMHQ, EnvSystemLLMFast, EnvEmbedModel, EnvSkillDirs, EnvLessonSearch} {
 		t.Setenv(e, "")
 	}
 }
@@ -395,5 +395,65 @@ func TestLoad_ExpandsTildeInPaths(t *testing.T) {
 	}
 	if cfg.Skills.Dirs[1] != "/abs/skills" {
 		t.Errorf("skills.dirs[1] = %q, want it untouched", cfg.Skills.Dirs[1])
+	}
+}
+
+// Lesson search: default on, and every layer able to turn it off.
+func TestResolve_LessonSearchLayers(t *testing.T) {
+	ptr := func(b bool) *bool { return &b }
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	const tiers = "system_llm_hq = \"cfg:hq\"\nsystem_llm_fast = \"cfg:fast\"\n"
+
+	for _, tc := range []struct {
+		name string
+		body string
+		env  string
+		flag *bool
+		want bool
+	}{
+		{"default is on", tiers, "", nil, true},
+		{"config off", tiers + "[lessons]\nsearch = false\n", "", nil, false},
+		{"config on", tiers + "[lessons]\nsearch = true\n", "", nil, true},
+		{"env beats config", tiers + "[lessons]\nsearch = true\n", "0", nil, false},
+		{"empty env reads as unset", tiers + "[lessons]\nsearch = false\n", "", nil, false},
+		{"flag beats env", tiers, "false", ptr(true), true},
+		{"flag off", tiers, "", ptr(false), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearLayerEnv(t)
+			if tc.env != "" {
+				t.Setenv(EnvLessonSearch, tc.env)
+			}
+			cfg, err := Resolve(write(t, tc.body), Overrides{LessonSearch: tc.flag})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.LessonSearchEnabled(); got != tc.want {
+				t.Errorf("LessonSearchEnabled() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A typo in the env var must not silently re-enable lesson recall: the whole
+// point of the switch is a run guaranteed not to read other runs' lessons.
+func TestResolve_LessonSearchRejectsGarbageEnv(t *testing.T) {
+	clearLayerEnv(t)
+	t.Setenv(EnvSystemLLMHQ, "x:hq")
+	t.Setenv(EnvSystemLLMFast, "x:fast")
+	t.Setenv(EnvLessonSearch, "flase")
+	_, err := Resolve(t.TempDir(), Overrides{})
+	if err == nil {
+		t.Fatal("expected an error for an unparseable AMPLIO_LESSON_SEARCH")
+	}
+	if !strings.Contains(err.Error(), EnvLessonSearch) {
+		t.Errorf("error should name the variable: %v", err)
 	}
 }

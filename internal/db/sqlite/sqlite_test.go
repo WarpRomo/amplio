@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -1426,5 +1427,64 @@ func TestMigrateDropsLegacyUserColumn(t *testing.T) {
 	}
 	if _, err := store.GetRun(context.Background(), "old1"); err != nil {
 		t.Errorf("legacy run lost after migrate: %v", err)
+	}
+}
+
+// A commit listener is handed the event with the step it landed at. The write
+// path builds events without column fields (they are json:"-", injected on
+// read), so the store has to stamp the step before firing — otherwise every
+// listener sees step 0 and silently misfiles whatever it derives from it.
+func TestCommitListener_EventCarriesCommittedStep(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	runID, sessID := db.NewRunID(), "agent"
+	if err := s.CreateRun(ctx, db.RunRecord{RunID: runID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession(ctx, db.SessionRecord{RunID: runID, SessionID: sessID, Status: db.SessionIdle}); err != nil {
+		t.Fatal(err)
+	}
+
+	type seen struct {
+		content string
+		step    int
+	}
+	var mu sync.Mutex
+	var got []seen
+	s.SetCommitListener(func(_, _ string, evt event.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		if a, ok := evt.(*event.AssistantEvent); ok {
+			got = append(got, seen{a.Content, a.Step})
+		}
+	})
+
+	// AppendEvent files at the session's current step: advance twice so a
+	// stamped 0 can't pass by accident.
+	for i := 0; i < 2; i++ {
+		if _, err := s.AdvanceStep(ctx, runID, sessID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.AppendEvent(ctx, runID, sessID, &event.AssistantEvent{Content: "append"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendEventAtStep(ctx, runID, sessID, 5, &event.AssistantEvent{Content: "at-step"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinalizeStep(ctx, runID, sessID, 7, []event.Event{&event.AssistantEvent{Content: "finalize"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]int{"append": 2, "at-step": 5, "finalize": 7}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != len(want) {
+		t.Fatalf("listener saw %d assistant events, want %d: %+v", len(got), len(want), got)
+	}
+	for _, g := range got {
+		if w, ok := want[g.content]; !ok || g.step != w {
+			t.Errorf("%q committed at step %d, want %d", g.content, g.step, w)
+		}
 	}
 }

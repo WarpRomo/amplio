@@ -111,6 +111,22 @@ CREATE TABLE IF NOT EXISTS CustomModel (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Plain-prose restatements of agent conclusion messages (see
+-- internal/responserewrite). A CACHE, not a record: the event remains the
+-- source of truth, a row may be absent for any reason (feature off, model
+-- failed, run predates it), and dropping the table only costs the toggle.
+-- Keyed by step alone: a step holds at most one assistant turn and steps only
+-- increase, so the step identifies the message.
+CREATE TABLE IF NOT EXISTS ResponseRewrite (
+    run_id     TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    step       INTEGER NOT NULL,
+    model      TEXT NOT NULL DEFAULT '',
+    text       TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (run_id, session_id, step)
+);
+
 -- Cached skill-description embeddings, keyed by embedder model + skill name, so
 -- unchanged skills aren't re-embedded on startup (content_hash invalidates one).
 -- description/path/body let the in-memory Index hydrate FULLY from cache without

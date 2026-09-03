@@ -16,6 +16,7 @@ package server
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"sort"
 	"time"
@@ -40,6 +41,10 @@ type chatBubble struct {
 	Step      int            `json:"step"`
 	CreatedAt time.Time      `json:"created_at"`
 	ToolCalls []chatToolCall `json:"tool_calls"`
+	// Rewrite is a plain-prose restatement of Content, when one exists (see
+	// internal/responserewrite). Sent alongside the original, never instead of
+	// it: the client offers both and the original stays the record.
+	Rewrite string `json:"rewrite,omitempty"`
 }
 
 type chatToolCall struct {
@@ -112,6 +117,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// One read for the whole feed. A failure here is not fatal: the rewrites are
+	// an optional overlay, and a chat that renders without them is still correct.
+	rewrites, err := s.store.ListResponseRewrites(r.Context(), id, sid)
+	if err != nil {
+		slog.Warn("chat: response rewrites unavailable", "run_id", id, "session_id", sid, "error", err)
+		rewrites = nil
+	}
 
 	// A tool call is "done" once any tool_result for its id exists in the session;
 	// errored if that result carried the tool's IsError flag.
@@ -149,10 +161,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 					ID: tc.ID, Name: tc.Name, Verb: verb, Completed: completed[tc.ID], Errored: errored[tc.ID], Detail: detail,
 				})
 			}
+			// A rewrite exists only for conclusions, and only for a session whose
+			// model opted in; absent is the normal case and means "show the
+			// original, offer no toggle".
+			rewrite := rewrites[rec.Step].Text
 			msgs = append(msgs, chatBubble{
 				EventID: rec.EventID, Kind: "chatbot", Content: ev.Content,
 				Thoughts: ev.Thoughts, Step: rec.Step, CreatedAt: rec.CreatedAt,
-				ToolCalls: tcs,
+				ToolCalls: tcs, Rewrite: rewrite,
 			})
 		case *event.MessageEvent:
 			// Inbound message: another agent (send_message) or the environment

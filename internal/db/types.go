@@ -351,3 +351,14 @@ type LessonBrowseOpts struct {
 	Limit  int
 	Offset int
 }
+
+// ResponseRewriteRecord is a conclusion message restated in plainer prose,
+// identified by its step: a step holds at most one assistant turn.
+type ResponseRewriteRecord struct {
+	RunID     string
+	SessionID string
+	Step      int
+	Model     string
+	Text      string
+	CreatedAt time.Time
+}
