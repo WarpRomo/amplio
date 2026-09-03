@@ -367,6 +367,46 @@ func TestStream_Tolerances(t *testing.T) {
 			}
 		},
 	}, {
+		// Some OpenAI-compatible layers reuse index 0 for every parallel call
+		// while still sending distinct stable IDs. Keying only by index merges the
+		// calls and concatenates two complete JSON objects into invalid arguments.
+		name: "duplicate indexes with distinct ids",
+		sse: `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ag3uhay4","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]}}]}` + "\n" +
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_mqsdew2c","function":{"name":"read_file","arguments":"{\"path\":\"b.rs\"}"}}]}}]}` + "\n" +
+			"data: [DONE]\n",
+		check: func(t *testing.T, r *llm.Response) {
+			if len(r.ToolCalls) != 2 {
+				t.Fatalf("tool calls = %d, want 2: %+v", len(r.ToolCalls), r.ToolCalls)
+			}
+			want := []struct {
+				id   string
+				args string
+			}{
+				{"call_ag3uhay4", `{"path":"a.rs"}`},
+				{"call_mqsdew2c", `{"path":"b.rs"}`},
+			}
+			for i, tc := range r.ToolCalls {
+				if tc.ID != want[i].id || tc.Name != "read_file" || tc.Arguments != want[i].args {
+					t.Errorf("call %d = %+v, want id=%q/name=read_file/args=%q", i, tc, want[i].id, want[i].args)
+				}
+			}
+		},
+	}, {
+		// A real ID may arrive after an initial fragment that had only an index.
+		// That is still one call, not a duplicate-index collision.
+		name: "late id stays on the existing call",
+		sse: `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":"{\"x\":"}}]}}]}` + "\n" +
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"real-id","function":{"arguments":"1}"}}]}}]}` + "\n" +
+			"data: [DONE]\n",
+		check: func(t *testing.T, r *llm.Response) {
+			if len(r.ToolCalls) != 1 {
+				t.Fatalf("tool calls = %d, want 1: %+v", len(r.ToolCalls), r.ToolCalls)
+			}
+			if got := r.ToolCalls[0]; got.ID != "real-id" || got.Name != "f" || got.Arguments != `{"x":1}` {
+				t.Errorf("call = %+v, want real-id/f/{\"x\":1}", got)
+			}
+		},
+	}, {
 		// Reasoning under either field name lands in Thoughts.
 		name: "reasoning_content and reasoning",
 		sse: `data: {"choices":[{"delta":{"reasoning_content":"think "}}]}` + "\n" +

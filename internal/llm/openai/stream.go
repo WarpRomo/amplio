@@ -55,9 +55,11 @@ type chatChunk struct {
 type accumulator struct {
 	text     strings.Builder
 	thoughts strings.Builder
-	// byIndex maps a tool call's stream index to its slot in `calls`. `index` is
-	// optional in the wire format; absent means 0.
+	// byIndex maps a tool call's stream index to its current slot in `calls`.
+	// byID disambiguates compatibility servers that reuse an index for distinct
+	// parallel calls. `index` is optional in the wire format; absent means 0.
 	byIndex    map[int]int
+	byID       map[string]int
 	calls      []llm.ToolCall
 	args       []*strings.Builder
 	stop       string
@@ -68,7 +70,11 @@ type accumulator struct {
 }
 
 func newAccumulator(captureExtras bool) *accumulator {
-	return &accumulator{byIndex: map[int]int{}, captureExt: captureExtras}
+	return &accumulator{
+		byIndex:    map[int]int{},
+		byID:       map[string]int{},
+		captureExt: captureExtras,
+	}
 }
 
 // add folds one frame in and reports the incremental events it produced (for
@@ -113,6 +119,23 @@ func (a *accumulator) addToolCall(tc respToolCall) []llm.StreamEvent {
 		idx = *tc.Index
 	}
 	slot, seen := a.byIndex[idx]
+	if tc.ID != "" {
+		if idSlot, ok := a.byID[tc.ID]; ok {
+			// A stable server ID wins over a bad/reused index. This also lets
+			// interleaved fragments find an earlier call again.
+			slot, seen = idSlot, true
+			a.byIndex[idx] = slot
+		} else if seen {
+			// If this slot already has a server-provided ID, a different ID at
+			// the same index is a distinct call. Some compatibility layers have
+			// been observed to emit index=0 for every parallel tool call.
+			if existing := a.calls[slot].ID; existing != "" {
+				if existingSlot, ok := a.byID[existing]; ok && existingSlot == slot {
+					seen = false
+				}
+			}
+		}
+	}
 	if !seen {
 		slot = len(a.calls)
 		a.byIndex[idx] = slot
@@ -126,6 +149,7 @@ func (a *accumulator) addToolCall(tc respToolCall) []llm.StreamEvent {
 	}
 	if tc.ID != "" {
 		a.calls[slot].ID = tc.ID
+		a.byID[tc.ID] = slot
 	}
 
 	var events []llm.StreamEvent
