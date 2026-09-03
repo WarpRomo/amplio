@@ -235,6 +235,141 @@ func TestStream_LiteLLMGemini_WholeToolCallPerDelta(t *testing.T) {
 	}
 }
 
+// LiteLLM/Gemini attaches opaque thought signatures to tool calls. Amplio must
+// preserve those fields across its event DB and replay them on the assistant
+// tool-call message; otherwise later tool turns can lose Gemini's reasoning
+// context even though the visible call id/name/arguments survived.
+func TestStream_LiteLLMGemini_ReplaysToolProviderFields(t *testing.T) {
+	srv, _ := serveSSE(t, fixture(t, "litellm-gemini-tools.sse"))
+	resp := drain(t, mustStream(t, newProvider(t, srv.URL, "capture_extras", "true")))
+	if resp.ProviderExtra == nil {
+		t.Fatal("ProviderExtra = nil, want captured LiteLLM/Gemini tool metadata")
+	}
+	if _, ok := resp.ProviderExtra[toolCallExtraFieldsKey]; !ok {
+		t.Fatalf("ProviderExtra lacks %q: %+v", toolCallExtraFieldsKey, resp.ProviderExtra)
+	}
+	if _, ok := resp.ProviderExtra[providerSpecificFieldsKey]; !ok {
+		t.Fatalf("existing message-level provider metadata was lost: %+v", resp.ProviderExtra)
+	}
+
+	// Simulate persistence: AssistantEvent.ProviderExtra is JSON-encoded by the DB
+	// and decoded later as generic map[string]any before convertMessages sees it.
+	blob, err := json.Marshal(resp.ProviderExtra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var revived map[string]any
+	if err := json.Unmarshal(blob, &revived); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs := convertMessages(llm.Request{Messages: []llm.Message{{
+		Role: llm.RoleAssistant, Content: resp.Content, ToolCalls: resp.ToolCalls, ProviderExtra: revived,
+	}}})
+	assistant := msgs[0].(map[string]any)
+	calls := assistant["tool_calls"].([]any)
+	if len(calls) != 2 {
+		t.Fatalf("replayed tool calls = %d, want 2", len(calls))
+	}
+	first := calls[0].(map[string]any)
+	fields, ok := first["provider_specific_fields"].(map[string]json.RawMessage)
+	if !ok {
+		t.Fatalf("first tool call provider_specific_fields = %#v", first["provider_specific_fields"])
+	}
+	var sig string
+	if err := json.Unmarshal(fields["thought_signature"], &sig); err != nil || sig == "" {
+		t.Errorf("first tool call thought_signature missing after DB round trip: %#v", fields)
+	}
+	// Gemini parallel calls sign the first call only in this real capture. Do not
+	// invent an empty provider_specific_fields object for the second call.
+	second := calls[1].(map[string]any)
+	if _, ok := second["provider_specific_fields"]; ok {
+		t.Errorf("second tool call unexpectedly grew provider_specific_fields: %#v", second)
+	}
+}
+
+func TestStream_LiteLLMGemini_CaptureExtrasOffByDefault(t *testing.T) {
+	srv, _ := serveSSE(t, fixture(t, "litellm-gemini-tools.sse"))
+	resp := drain(t, mustStream(t, newProvider(t, srv.URL)))
+	if resp.ProviderExtra != nil {
+		t.Fatalf("ProviderExtra = %+v with capture_extras unset, want nil", resp.ProviderExtra)
+	}
+}
+
+// Google's official Gemini OpenAI-compatible endpoint places required thought
+// signatures under tool_calls[].extra_content.google.thought_signature. This is
+// a different wire shape from LiteLLM's provider_specific_fields and must be
+// round-tripped unchanged for the next tool-result turn.
+func TestCall_GeminiExtraContentSurvivesDBReplay(t *testing.T) {
+	srv, _ := serveJSON(t, 200, `{"choices":[{"finish_reason":"tool_calls","message":{"content":"","tool_calls":[{"id":"function-call-1","type":"function","function":{"name":"get_github_repo","arguments":"{\"owner\":\"google-deepmind\",\"repo\":\"amplio\"}"},"extra_content":{"google":{"thought_signature":"gemini-sig-1"}}}]}}]}`)
+	resp, err := newProvider(t, srv.URL, "capture_extras", "true").Call(context.Background(), llm.Request{})
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if resp.ProviderExtra == nil {
+		t.Fatal("ProviderExtra = nil, want Gemini tool-call extra_content")
+	}
+
+	blob, err := json.Marshal(resp.ProviderExtra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var revived map[string]any
+	if err := json.Unmarshal(blob, &revived); err != nil {
+		t.Fatal(err)
+	}
+	msgs := convertMessages(llm.Request{Messages: []llm.Message{{
+		Role: llm.RoleAssistant, ToolCalls: resp.ToolCalls, ProviderExtra: revived,
+	}}})
+	call := msgs[0].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+	extraContent, ok := call["extra_content"].(map[string]json.RawMessage)
+	if !ok {
+		t.Fatalf("replayed extra_content = %#v", call["extra_content"])
+	}
+	var googleFields map[string]string
+	if err := json.Unmarshal(extraContent["google"], &googleFields); err != nil {
+		t.Fatal(err)
+	}
+	if got := googleFields["thought_signature"]; got != "gemini-sig-1" {
+		t.Errorf("thought_signature = %q, want gemini-sig-1", got)
+	}
+}
+
+func TestStream_GeminiExtraContentSurvivesDBReplay(t *testing.T) {
+	const body = `data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"id":"function-call-1","type":"function","function":{"name":"get_github_repo","arguments":"{\"owner\":\"google-deepmind\",\"repo\":\"amplio\"}"},"extra_content":{"google":{"thought_signature":"gemini-stream-sig"}}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+`
+	srv, _ := serveSSE(t, body)
+	resp := drain(t, mustStream(t, newProvider(t, srv.URL, "capture_extras", "true")))
+	fields := replayToolCallExtraFields(resp.ProviderExtra)
+	if len(fields) != 1 {
+		t.Fatalf("tool extra fields = %#v, want one entry", fields)
+	}
+	var googleFields map[string]string
+	if err := json.Unmarshal(fields[0].ExtraContent["google"], &googleFields); err != nil {
+		t.Fatal(err)
+	}
+	if got := googleFields["thought_signature"]; got != "gemini-stream-sig" {
+		t.Errorf("thought_signature = %q, want gemini-stream-sig", got)
+	}
+}
+
+func TestConvertMessages_MalformedToolExtraFieldsAreIgnored(t *testing.T) {
+	msgs := convertMessages(llm.Request{Messages: []llm.Message{{
+		Role:          llm.RoleAssistant,
+		ToolCalls:     []llm.ToolCall{{ID: "c1", Name: "f", Arguments: `{}`}},
+		ProviderExtra: map[string]any{toolCallExtraFieldsKey: "not-json"},
+	}}})
+	call := msgs[0].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+	if _, ok := call["provider_specific_fields"]; ok {
+		t.Errorf("malformed captured metadata should be ignored, got %#v", call)
+	}
+	if _, ok := call["extra_content"]; ok {
+		t.Errorf("malformed captured metadata should not produce extra_content, got %#v", call)
+	}
+}
+
 // Real capture from the REFERENCE implementation (api.openai.com, gpt-5.4-nano).
 // This is the dialect every other server claims compatibility with, and it is
 // the most aggressive splitter of the three: arguments arrive in four fragments
@@ -489,6 +624,25 @@ func TestCall_ToolCallsAndCachedTokens(t *testing.T) {
 	}
 	if resp.Usage.CacheReadTokens != 6 {
 		t.Errorf("cache read = %d, want 6", resp.Usage.CacheReadTokens)
+	}
+}
+
+func TestCall_CapturesToolProviderFields(t *testing.T) {
+	srv, _ := serveJSON(t, 200, `{"choices":[{"message":{"content":"","provider_specific_fields":{"trace_id":"trace-1"},"tool_calls":[{"id":"c1","function":{"name":"f","arguments":"{}"},"provider_specific_fields":{"thought_signature":"sig-1"}}]}}]}`)
+	resp, err := newProvider(t, srv.URL, "capture_extras", "true").Call(context.Background(), llm.Request{})
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if _, ok := resp.ProviderExtra[providerSpecificFieldsKey]; !ok {
+		t.Fatalf("message-level provider metadata was lost: %+v", resp.ProviderExtra)
+	}
+	fields := replayToolCallExtraFields(resp.ProviderExtra)
+	if len(fields) != 1 {
+		t.Fatalf("captured tool extra fields = %#v, want one entry", fields)
+	}
+	var sig string
+	if err := json.Unmarshal(fields[0].ProviderSpecificFields["thought_signature"], &sig); err != nil || sig != "sig-1" {
+		t.Errorf("captured provider_specific_fields = %#v, want thought_signature=sig-1", fields[0].ProviderSpecificFields)
 	}
 }
 

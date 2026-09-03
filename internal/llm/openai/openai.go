@@ -43,6 +43,11 @@ const requestTimeout = 30 * time.Minute
 // bytes each and arrive many-per-chunk.
 const sseMaxLine = 4 << 20
 
+const (
+	providerSpecificFieldsKey = "openai.provider_specific_fields"
+	toolCallExtraFieldsKey    = "openai.tool_call_extra_fields"
+)
+
 // ClientArgs are the arguments this provider interprets — the `{k=v}` block in
 // a spec (see internal/llm/spec.go). They never reach the request body.
 // Everything else is passed through verbatim (see buildBody), so a
@@ -92,10 +97,10 @@ type provider struct {
 	// extra holds spec-arg passthrough already expanded from dotted paths, merged
 	// into every request body.
 	extra map[string]any
-	// captureExtras stores non-standard reasoning containers on the response's
-	// ProviderExtra. Off by default: v1 never replays them, and the signatures are
-	// large enough that persisting them on every turn is pure cost. The seam is
-	// here so replay support is a read of data we already have.
+	// captureExtras preserves non-standard provider metadata on ProviderExtra.
+	// Off by default because these opaque fields can be large. When enabled,
+	// per-tool fields are replayed on later assistant tool-call turns; message-level
+	// fields are retained for inspection but are not replayed.
 	captureExtras bool
 }
 
@@ -309,16 +314,26 @@ func convertMessages(req llm.Request) []any {
 			// some servers reject a missing content field, so always send it.
 			msg["content"] = m.Content
 			if len(m.ToolCalls) > 0 {
+				callExtras := replayToolCallExtraFields(m.ProviderExtra)
 				calls := make([]any, 0, len(m.ToolCalls))
-				for _, tc := range m.ToolCalls {
+				for i, tc := range m.ToolCalls {
 					args := tc.Arguments
 					if strings.TrimSpace(args) == "" {
 						args = "{}" // a null/empty argument string is invalid JSON to strict servers
 					}
-					calls = append(calls, map[string]any{
+					call := map[string]any{
 						"id": tc.ID, "type": "function",
 						"function": map[string]any{"name": tc.Name, "arguments": args},
-					})
+					}
+					if i < len(callExtras) {
+						if len(callExtras[i].ProviderSpecificFields) > 0 {
+							call["provider_specific_fields"] = callExtras[i].ProviderSpecificFields
+						}
+						if len(callExtras[i].ExtraContent) > 0 {
+							call["extra_content"] = callExtras[i].ExtraContent
+						}
+					}
+					calls = append(calls, call)
 				}
 				msg["tool_calls"] = calls
 			}
@@ -333,6 +348,77 @@ func convertMessages(req llm.Request) []any {
 		}
 	}
 	return out
+}
+
+// toolCallExtraFields holds the non-standard fields that real OpenAI-compatible
+// servers attach to individual tool calls. LiteLLM uses provider_specific_fields;
+// Google's Gemini compatibility endpoint uses extra_content. Keep the wire shapes
+// distinct and opaque so replay does not reinterpret provider-owned state.
+type toolCallExtraFields struct {
+	ProviderSpecificFields map[string]json.RawMessage `json:"provider_specific_fields,omitempty"`
+	ExtraContent           map[string]json.RawMessage `json:"extra_content,omitempty"`
+}
+
+func (e toolCallExtraFields) empty() bool {
+	return len(e.ProviderSpecificFields) == 0 && len(e.ExtraContent) == 0
+}
+
+func (e *toolCallExtraFields) merge(tc respToolCall) {
+	if len(tc.ProviderSpecificFields) > 0 {
+		if e.ProviderSpecificFields == nil {
+			e.ProviderSpecificFields = map[string]json.RawMessage{}
+		}
+		for k, v := range tc.ProviderSpecificFields {
+			e.ProviderSpecificFields[k] = v
+		}
+	}
+	if len(tc.ExtraContent) > 0 {
+		if e.ExtraContent == nil {
+			e.ExtraContent = map[string]json.RawMessage{}
+		}
+		for k, v := range tc.ExtraContent {
+			e.ExtraContent[k] = v
+		}
+	}
+}
+
+// replayToolCallExtraFields decodes per-tool-call extension metadata captured
+// from an earlier assistant turn. The value is stored as JSON text inside
+// ProviderExtra so it survives the event DB's generic JSON round trip without
+// exposing provider-specific types to the core llm package. Malformed or legacy
+// values degrade to no replay rather than making conversation history unusable.
+func replayToolCallExtraFields(extra map[string]any) []toolCallExtraFields {
+	if len(extra) == 0 {
+		return nil
+	}
+	raw, ok := extra[toolCallExtraFieldsKey].(string)
+	if !ok || raw == "" {
+		return nil
+	}
+	var out []toolCallExtraFields
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func encodeToolCallExtraFields(calls []respToolCall) (string, bool) {
+	extras := make([]toolCallExtraFields, len(calls))
+	hasAny := false
+	for i, tc := range calls {
+		extras[i].merge(tc)
+		if !extras[i].empty() {
+			hasAny = true
+		}
+	}
+	if !hasAny {
+		return "", false
+	}
+	blob, err := json.Marshal(extras)
+	if err != nil {
+		return "", false
+	}
+	return string(blob), true
 }
 
 // userMessage builds a user turn, using the multi-part form only when there are
@@ -490,6 +576,8 @@ type respToolCall struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
+	ProviderSpecificFields map[string]json.RawMessage `json:"provider_specific_fields"`
+	ExtraContent           map[string]json.RawMessage `json:"extra_content"`
 }
 
 // reasoning fields, in the order we prefer them. No server sends more than one
@@ -513,7 +601,8 @@ type chatResponse struct {
 			Content   content        `json:"content"`
 			ToolCalls []respToolCall `json:"tool_calls"`
 			reasoningFields
-			Extra map[string]json.RawMessage `json:"provider_specific_fields"`
+			ProviderSpecificFields map[string]json.RawMessage `json:"provider_specific_fields"`
+			ExtraContent           map[string]json.RawMessage `json:"extra_content"`
 		} `json:"message"`
 	} `json:"choices"`
 	Usage *apiUsage `json:"usage"`
@@ -551,10 +640,18 @@ func (p *provider) Call(ctx context.Context, req llm.Request) (*llm.Response, er
 			Arguments: tc.Function.Arguments,
 		})
 	}
-	if p.captureExtras && len(ch.Message.Extra) > 0 {
-		blob, err := json.Marshal(ch.Message.Extra)
-		if err == nil {
-			out.ProviderExtra = map[string]any{"openai.provider_specific_fields": string(blob)}
+	if p.captureExtras {
+		extra := map[string]any{}
+		if len(ch.Message.ProviderSpecificFields) > 0 {
+			if blob, err := json.Marshal(ch.Message.ProviderSpecificFields); err == nil {
+				extra[providerSpecificFieldsKey] = string(blob)
+			}
+		}
+		if blob, ok := encodeToolCallExtraFields(ch.Message.ToolCalls); ok {
+			extra[toolCallExtraFieldsKey] = blob
+		}
+		if len(extra) > 0 {
+			out.ProviderExtra = extra
 		}
 	}
 	return out, nil

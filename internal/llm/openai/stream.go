@@ -60,6 +60,7 @@ type accumulator struct {
 	byIndex    map[int]int
 	calls      []llm.ToolCall
 	args       []*strings.Builder
+	callExtras []toolCallExtraFields
 	stop       string
 	usage      llm.Usage
 	hasUsage   bool
@@ -118,6 +119,7 @@ func (a *accumulator) addToolCall(tc respToolCall) []llm.StreamEvent {
 		a.byIndex[idx] = slot
 		a.calls = append(a.calls, llm.ToolCall{ID: toolCallID(tc.ID, idx), Name: tc.Function.Name})
 		a.args = append(a.args, &strings.Builder{})
+		a.callExtras = append(a.callExtras, toolCallExtraFields{})
 	}
 	// A later frame may still be the one carrying id/name (servers vary on
 	// whether the first frame for an index has them), so fill any gap.
@@ -126,6 +128,9 @@ func (a *accumulator) addToolCall(tc respToolCall) []llm.StreamEvent {
 	}
 	if tc.ID != "" {
 		a.calls[slot].ID = tc.ID
+	}
+	if a.captureExt {
+		a.callExtras[slot].merge(tc)
 	}
 
 	var events []llm.StreamEvent
@@ -155,10 +160,28 @@ func (a *accumulator) response() *llm.Response {
 		c.Arguments = a.args[i].String()
 		out.ToolCalls = append(out.ToolCalls, c)
 	}
+	extra := map[string]any{}
 	if len(a.extra) > 0 {
 		if blob, err := json.Marshal(a.extra); err == nil {
-			out.ProviderExtra = map[string]any{"openai.provider_specific_fields": string(blob)}
+			extra[providerSpecificFieldsKey] = string(blob)
 		}
+	}
+	if a.captureExt {
+		hasAny := false
+		for _, fields := range a.callExtras {
+			if !fields.empty() {
+				hasAny = true
+				break
+			}
+		}
+		if hasAny {
+			if blob, err := json.Marshal(a.callExtras); err == nil {
+				extra[toolCallExtraFieldsKey] = string(blob)
+			}
+		}
+	}
+	if len(extra) > 0 {
+		out.ProviderExtra = extra
 	}
 	return out
 }
