@@ -55,9 +55,11 @@ type chatChunk struct {
 type accumulator struct {
 	text     strings.Builder
 	thoughts strings.Builder
-	// byIndex maps a tool call's stream index to its current slot in `calls`.
+	// byIndex maps a tool call's stream index to its original slot in `calls`.
 	// byID disambiguates compatibility servers that reuse an index for distinct
-	// parallel calls. `index` is optional in the wire format; absent means 0.
+	// parallel calls. Duplicate IDs must not retarget byIndex: ID-less
+	// continuations still belong to the original index slot. `index` is optional
+	// in the wire format; absent means 0.
 	byIndex    map[int]int
 	byID       map[string]int
 	calls      []llm.ToolCall
@@ -118,13 +120,13 @@ func (a *accumulator) addToolCall(tc respToolCall) []llm.StreamEvent {
 	if tc.Index != nil {
 		idx = *tc.Index
 	}
-	slot, seen := a.byIndex[idx]
+	indexSlot, indexSeen := a.byIndex[idx]
+	slot, seen := indexSlot, indexSeen
 	if tc.ID != "" {
 		if idSlot, ok := a.byID[tc.ID]; ok {
-			// A stable server ID wins over a bad/reused index. This also lets
-			// interleaved fragments find an earlier call again.
+			// A stable server ID wins over a bad/reused index without changing
+			// the canonical index route used by ID-less continuations.
 			slot, seen = idSlot, true
-			a.byIndex[idx] = slot
 		} else if seen {
 			// If this slot already has a server-provided ID, a different ID at
 			// the same index is a distinct call. Some compatibility layers have
@@ -138,7 +140,9 @@ func (a *accumulator) addToolCall(tc respToolCall) []llm.StreamEvent {
 	}
 	if !seen {
 		slot = len(a.calls)
-		a.byIndex[idx] = slot
+		if !indexSeen {
+			a.byIndex[idx] = slot
+		}
 		a.calls = append(a.calls, llm.ToolCall{ID: toolCallID(tc.ID, idx), Name: tc.Function.Name})
 		a.args = append(a.args, &strings.Builder{})
 	}

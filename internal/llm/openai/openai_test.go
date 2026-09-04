@@ -392,6 +392,25 @@ func TestStream_Tolerances(t *testing.T) {
 			}
 		},
 	}, {
+		// Once an index has been reused by a distinct stable ID, an ordinary
+		// ID-less continuation must still follow the index's original slot.
+		name: "duplicate index keeps idless continuation on original slot",
+		sse: `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_A","function":{"name":"read_file","arguments":"{\"path\":\"a"}}]}}]}` + "\n" +
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_B","function":{"name":"read_file","arguments":"{\"path\":\"b.rs\"}"}}]}}]}` + "\n" +
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":".rs\"}"}}]}}]}` + "\n" +
+			"data: [DONE]\n",
+		check: func(t *testing.T, r *llm.Response) {
+			if len(r.ToolCalls) != 2 {
+				t.Fatalf("tool calls = %d, want 2: %+v", len(r.ToolCalls), r.ToolCalls)
+			}
+			if got := r.ToolCalls[0]; got.ID != "call_A" || got.Name != "read_file" || got.Arguments != `{"path":"a.rs"}` {
+				t.Errorf("call 0 = %+v, want call_A/read_file/{\"path\":\"a.rs\"}", got)
+			}
+			if got := r.ToolCalls[1]; got.ID != "call_B" || got.Name != "read_file" || got.Arguments != `{"path":"b.rs"}` {
+				t.Errorf("call 1 = %+v, want call_B/read_file/{\"path\":\"b.rs\"}", got)
+			}
+		},
+	}, {
 		// A real ID may arrive after an initial fragment that had only an index.
 		// That is still one call, not a duplicate-index collision.
 		name: "late id stays on the existing call",
