@@ -351,6 +351,7 @@ func executeResume(cfg config.Config, runID string) error {
 	}
 	if revived == 0 {
 		slog.Info("run is already at rest; nothing to resume", "run_id", runID)
+		fin.OnMainAgentConcluded(ctx, runID)
 		return nil
 	}
 	slog.Info("run resumed", "run_id", runID, "sessions", revived, "model", run.Config.LLM)
