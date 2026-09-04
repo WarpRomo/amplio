@@ -21,8 +21,10 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"mime"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,6 +126,71 @@ func TestServer_Artifacts(t *testing.T) {
 	want := []string{"plan.md", "sub/note.txt"}
 	if len(gotPaths) != len(want) || gotPaths[0] != want[0] || gotPaths[1] != want[1] {
 		t.Errorf("recursive files = %v, want %v", gotPaths, want)
+	}
+}
+
+// A PDF must reach the browser's built-in viewer, which the artifact browser
+// embeds in a frame: served inline (an attachment would download it instead of
+// rendering it) under a sandbox that still lets the viewer script itself.
+//
+// Not parallel: config.SetDataDir pins the data dir for the whole process.
+func TestServer_ArtifactRaw_Disposition(t *testing.T) {
+	config.SetDataDir(t.TempDir())
+	t.Cleanup(func() { config.SetDataDir("") })
+	srv, _, _ := newTestServer(t)
+	h := srv.Handler()
+
+	base := config.ArtifactDir(testRun)
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const pdfName = "paper (v2).pdf" // spaces: the filename param must survive quoting
+	files := map[string]string{
+		pdfName:    "%PDF-1.4\n%\u00e2\u00e3\u00cf\u00d3\n",
+		"blob.bin": "\x00\x01\x02\x03", // unmapped extension, sniffs as binary
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(base, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fetch := func(name string) (http.Header, string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		path := "/api/runs/" + testRun + "/artifacts/raw?path=" + url.QueryEscape(name)
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d: %s", name, rec.Code, rec.Body.String())
+		}
+		return rec.Header(), rec.Body.String()
+	}
+
+	hdr, body := fetch(pdfName)
+	if body != files[pdfName] {
+		t.Errorf("pdf body = %q", body)
+	}
+	if ct := hdr.Get("Content-Type"); ct != "application/pdf" {
+		t.Errorf("pdf Content-Type = %q, want application/pdf", ct)
+	}
+	if disp, params, err := mime.ParseMediaType(hdr.Get("Content-Disposition")); err != nil ||
+		disp != "inline" || params["filename"] != pdfName {
+		t.Errorf("pdf Content-Disposition = %q (err %v), want inline + the real filename", hdr.Get("Content-Disposition"), err)
+	}
+	if csp := hdr.Get("Content-Security-Policy"); !strings.Contains(csp, "sandbox") || !strings.Contains(csp, "allow-scripts") {
+		t.Errorf("pdf CSP = %q, want a sandbox the viewer can still script in", csp)
+	}
+	if hdr.Get("X-Content-Type-Options") != "nosniff" {
+		t.Error("pdf served without nosniff")
+	}
+
+	// Everything else keeps downloading, under the bare sandbox.
+	hdr, _ = fetch("blob.bin")
+	if disp, params, err := mime.ParseMediaType(hdr.Get("Content-Disposition")); err != nil ||
+		disp != "attachment" || params["filename"] != "blob.bin" {
+		t.Errorf("binary Content-Disposition = %q (err %v), want attachment + the real filename", hdr.Get("Content-Disposition"), err)
+	}
+	if csp := hdr.Get("Content-Security-Policy"); strings.Contains(csp, "allow-scripts") {
+		t.Errorf("binary CSP = %q, want the bare sandbox", csp)
 	}
 }
 

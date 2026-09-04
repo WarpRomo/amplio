@@ -16,6 +16,8 @@ package main
 
 import (
 	"context"
+	"net/url"
+	"path/filepath"
 	"testing"
 
 	"amplio/internal/agent/critic"
@@ -79,5 +81,74 @@ func TestBackfillReports(t *testing.T) {
 	}
 	if len(reports) != 1 {
 		t.Fatalf("second backfill produced %d reports, want 1", len(reports))
+	}
+}
+
+func TestExecuteResume_BackfillsMissingReportForRestingRun(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	config.SetDataDir(dataDir)
+	t.Cleanup(func() { config.SetDataDir("") })
+
+	dbPath := filepath.Join(dataDir, "amplio.db")
+	store, err := sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, db.RunRecord{
+		RunID:  "r",
+		Config: config.RunConfig{Task: "t"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession(ctx, db.SessionRecord{
+		RunID: "r", SessionID: config.RootAgentSessionID,
+		AgentType: "standard_agent", Status: db.SessionConcluded,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AdvanceStep(ctx, "r", config.RootAgentSessionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	const providerName = "resume-test"
+	old, hadOld := providerRegistry[providerName]
+	providerRegistry[providerName] = providerEntry{
+		new: func(_ string, _ int, _, _ url.Values) (llm.Provider, error) {
+			return stubHQ{}, nil
+		},
+	}
+	t.Cleanup(func() {
+		if hadOld {
+			providerRegistry[providerName] = old
+		} else {
+			delete(providerRegistry, providerName)
+		}
+	})
+
+	cfg := config.Config{
+		DB:            dbPath,
+		SystemLLMHQ:   providerName + ":hq",
+		SystemLLMFast: providerName + ":fast",
+	}
+	if err := executeResume(cfg, "r"); err != nil {
+		t.Fatalf("executeResume: %v", err)
+	}
+
+	store, err = sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	reports, err := critic.AllReports(ctx, store, "r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("resume produced %d reports, want 1", len(reports))
 	}
 }

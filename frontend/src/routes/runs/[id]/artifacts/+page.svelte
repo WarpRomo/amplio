@@ -36,6 +36,10 @@
 	const store = getRunStore();
 	const runLabel = $derived(store.detail?.title || store.detail?.task || runId);
 	const urlFile = $derived(page.url.searchParams.get('file') ?? '');
+	// A #anchor addresses a place inside the open file (`#page=7` in a PDF), so it
+	// stays a URL fragment rather than becoming part of ?file=. Reload and "copy
+	// link" keep the page you were on; opening another file drops it.
+	const urlAnchor = $derived(page.url.hash);
 
 	let viewer = $state<ArtifactBrowser>();
 	let selectedFile = $state('');
@@ -47,9 +51,14 @@
 	//
 	// The equality check is what keeps this from looping: our own write flows back
 	// in as `initialFile`, and the echo it produces matches the URL and stops here.
-	function onSelect(file: string, via: 'click' | 'keyboard' | 'link' | 'browse' | 'restore') {
-		if (file === urlFile) return;
+	function onSelect(
+		file: string,
+		via: 'click' | 'keyboard' | 'link' | 'browse' | 'restore',
+		anchor = ''
+	) {
+		if (file === urlFile && anchor === urlAnchor) return;
 		const url = new URL(page.url);
+		url.hash = anchor; // an anchor belongs to ONE file; a new file clears it
 		if (file) url.searchParams.set('file', file);
 		else url.searchParams.delete('file');
 		// noScroll/keepFocus: this is an in-place state update, not a page change —
@@ -77,4 +86,10 @@
 	<title>{pageTitle(runLabel)}</title>
 </svelte:head>
 
-<ArtifactBrowser bind:this={viewer} bind:selectedFile {runId} initialFile={urlFile} {onSelect} />
+<ArtifactBrowser
+	bind:this={viewer}
+	bind:selectedFile
+	{runId}
+	initialFile={urlFile ? urlFile + urlAnchor : ''}
+	{onSelect}
+/>
