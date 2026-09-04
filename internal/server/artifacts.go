@@ -226,14 +226,56 @@ func (s *Server) handleArtifactRaw(w http.ResponseWriter, r *http.Request) {
 	if ct == "" {
 		ct = http.DetectContentType(buf[:n])
 	}
+	// The base type (no ";charset=…") decides how the file is delivered: which
+	// sandbox it gets, and whether it displays or downloads. A malformed type is
+	// neither PDF nor inline-safe, so it downloads.
+	mt, _, _ := mime.ParseMediaType(ct)
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
-	// Inline-preview only safe types; everything else downloads.
-	if !strings.HasPrefix(ct, "image/") && !strings.HasPrefix(ct, "text/") {
-		w.Header().Set("Content-Disposition", "attachment")
-	}
+	w.Header().Set("Content-Security-Policy", artifactCSP(mt))
+	// Either way the real filename rides along, so a Save lands on "paper.pdf"
+	// and not on the endpoint's name ("raw").
+	w.Header().Set("Content-Disposition", contentDisposition(inlineType(mt), fi.Name()))
 	http.ServeContent(w, r, fi.Name(), fi.ModTime(), f)
+}
+
+// pdfType is the one binary type the viewer embeds instead of downloading.
+const pdfType = "application/pdf"
+
+// inlineType reports whether the browser may display media type mt in place
+// rather than download it: text and images, plus PDF, which every current
+// browser renders with a built-in viewer the artifact browser embeds in a frame.
+func inlineType(mt string) bool {
+	return mt == pdfType || strings.HasPrefix(mt, "image/") || strings.HasPrefix(mt, "text/")
+}
+
+// artifactCSP is the sandbox an artifact is served under, so agent-written
+// HTML/SVG can't execute JS in the dashboard origin.
+//
+// A PDF gets two extra tokens, for the browsers that implement their viewer as
+// an ordinary scripted document (Firefox's is pdf.js): allow-scripts lets the
+// viewer run and allow-downloads keeps its Save button working. Neither weakens
+// the isolation that matters here — the sandbox still forces an opaque origin,
+// with no reach into the dashboard's DOM, cookies or storage — and Chrome needs
+// neither: it ignores CSP sandbox on a PDF response (crbug.com/40754148).
+func artifactCSP(mt string) string {
+	if mt == pdfType {
+		return "sandbox allow-scripts allow-downloads; default-src 'none'"
+	}
+	return "sandbox; default-src 'none'"
+}
+
+// contentDisposition builds a Content-Disposition value that carries the file's
+// real name (RFC 2231-encoded when it isn't plain ASCII).
+func contentDisposition(inline bool, name string) string {
+	kind := "attachment"
+	if inline {
+		kind = "inline"
+	}
+	if v := mime.FormatMediaType(kind, map[string]string{"filename": name}); v != "" {
+		return v
+	}
+	return kind // unencodable name; the disposition still applies
 }
 
 // cleanArtifactSub trims a leading slash so callers may pass "/foo" or "foo";

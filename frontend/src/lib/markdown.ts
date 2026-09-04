@@ -17,6 +17,7 @@
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import { artifactRawUrl } from '$lib/api';
+import { isPdfPath } from '$lib/pdf';
 import { linkifyShortlinks } from '$lib/internal';
 import { markedHighlight } from 'marked-highlight';
 import hljs from 'highlight.js/lib/core';
@@ -222,22 +223,25 @@ function rewriteRelativeUrls(html: string, runId: string, baseDir: string): stri
 	for (const a of doc.querySelectorAll('a[href]')) {
 		const href = a.getAttribute('href') ?? '';
 		if (!href || ABSOLUTE_URL_RE.test(href)) continue;
-		const { path, isDir } = resolveArtifactPath(baseDir, href);
+		const { path, suffix, isDir } = resolveArtifactPath(baseDir, href);
+		// A #fragment normally addresses a heading inside the target document, which
+		// the viewer can't anchor to — so it's dropped. On a PDF it's the opposite:
+		// `paper.pdf#page=7` is the built-in viewer's own syntax, and carrying it
+		// through is what lets a citation land on the page it cites.
+		const anchor = !isDir && suffix.startsWith('#') && isPdfPath(path) ? suffix : '';
 		// An inter-file link is a link between DOCUMENTS, so it should land in the
 		// viewer, not dump the raw bytes: data-artifact-path is the in-app hook the
 		// artifact browser intercepts (see its artifactLinks action) to open the
 		// target in its own preview pane. A trailing slash marks a directory link.
-		a.setAttribute('data-artifact-path', isDir ? `${path}/` : path);
+		a.setAttribute('data-artifact-path', isDir ? `${path}/` : path + anchor);
 		// The href stays a REAL link so ⌘/middle-click still opens a new tab — but
 		// pointed at the artifacts ROUTE, so that tab lands in the viewer too
 		// (previously this was the raw endpoint, i.e. an unrendered file dump).
 		// Directories have no route-level deep link yet, so they open at the root.
-		// The #fragment is dropped: it addresses a heading inside the target
-		// document, which the viewer doesn't (yet) anchor to.
 		a.setAttribute(
 			'href',
 			path && !isDir
-				? `/runs/${runId}/artifacts?file=${encodeURIComponent(path)}`
+				? `/runs/${runId}/artifacts?file=${encodeURIComponent(path)}${anchor}`
 				: `/runs/${runId}/artifacts`,
 		);
 		if (!a.getAttribute('title')) {

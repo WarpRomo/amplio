@@ -26,10 +26,12 @@
 	import { api, artifactRawUrl, errorText } from '$lib/api';
 	import { renderMarkdown, highlightFile } from '$lib/markdown';
 	import { fuzzyFilter } from '$lib/fuzzy';
+	import { isPdfPath, splitAnchor, PDF_MAGIC } from '$lib/pdf';
 	import type { ArtifactEntry, ArtifactFile } from '$lib/types';
 	import {
 		FolderIcon,
 		FileIcon,
+		FilePdfIcon,
 		ArrowClockwiseIcon,
 		CopyIcon,
 		CheckIcon,
@@ -47,7 +49,8 @@
 		// (the chat aside) offer a panel-level "Expand" that knows what's open.
 		selectedFile = $bindable(''),
 		// When set, an Expand control appears in the toolbar (compact/side-panel use);
-		// called with the currently-selected file ("" if none) to bridge to full page.
+		// called with the currently-selected file, #anchor included ("" if none), to
+		// bridge to full page.
 		onExpand,
 		// Base URL of the full Artifacts page (e.g. /runs/<id>/artifacts). When set,
 		// the Expand control renders as a real <a href> (so it's middle-clickable /
@@ -68,6 +71,8 @@
 		//   keyboard arrow-stepping the list       → scanning, replace
 		//   browse   changed directory, no file    → not a document, replace
 		//   restore  driven BY the URL / the host  → already reflected, replace
+		// `anchor` is the in-file view hint that came with the selection (`#page=7`
+		// on a PDF, "" for none) — a URL fragment, not part of the file's identity.
 		// The component itself stays URL-agnostic — the chat side panel passes no
 		// handler and must never touch the address bar.
 		onSelect
@@ -79,7 +84,11 @@
 		onExpand?: (file: string) => void;
 		expandBase?: string;
 		toolbarEnd?: import('svelte').Snippet;
-		onSelect?: (file: string, via: 'click' | 'keyboard' | 'link' | 'browse' | 'restore') => void;
+		onSelect?: (
+			file: string,
+			via: 'click' | 'keyboard' | 'link' | 'browse' | 'restore',
+			anchor?: string
+		) => void;
 	} = $props();
 
 	// How a selection change came about; drives the host's history policy.
@@ -98,7 +107,9 @@
 		selectedFile = selected;
 	});
 
-	let previewKind = $state<'none' | 'image' | 'text' | 'markdown' | 'binary' | 'missing'>('none');
+	let previewKind = $state<'none' | 'image' | 'pdf' | 'text' | 'markdown' | 'binary' | 'missing'>(
+		'none'
+	);
 	let previewText = $state('');
 	let copied = $state('');
 
@@ -169,9 +180,15 @@
 	// reloadTick cache-busts the raw URL on an explicit preview refresh (so an
 	// updated file / image re-fetches instead of serving the browser cache).
 	let reloadTick = $state(0);
+	// A #anchor asked for with the selection (`paper.pdf#page=7`): a view hint for
+	// the PDF frame, kept out of `selected` so the file's identity — and the ?file=
+	// the host mirrors it into — stays a plain path. Always last in the URL.
+	let previewAnchor = $state('');
 	const rawUrl = $derived(
 		selected
-			? artifactRawUrl(runId, selected) + (reloadTick ? `&_=${reloadTick}` : '')
+			? artifactRawUrl(runId, selected) +
+				(reloadTick ? `&_=${reloadTick}` : '') +
+				previewAnchor
 			: ''
 	);
 
@@ -198,19 +215,33 @@
 	}
 
 	// Preview a file by its FULL subpath (dir-independent, so deep-linking works).
-	// `via` is passed straight through to onSelect (see the prop docs).
-	async function previewPath(full: string, size: number | null, via: NavVia = 'click') {
+	// `via` is passed straight through to onSelect (see the prop docs); `anchor` is
+	// the optional in-file view hint (`#page=7`), which travels beside the path
+	// rather than in it — see previewAnchor.
+	async function previewPath(
+		full: string,
+		size: number | null,
+		via: NavVia = 'click',
+		anchor = ''
+	) {
 		selected = full;
+		previewAnchor = anchor;
 		// Treat every selection as "the initial file is now this", so a host echoing
 		// it back through the initialFile prop (the route writing ?file= after our
 		// own onSelect) is recognised as already-applied and doesn't re-fetch.
-		lastInitial = full;
-		onSelect?.(full, via);
+		lastInitial = full + anchor;
+		onSelect?.(full, via, anchor);
 		previewText = '';
 		copied = '';
 		const name = full.slice(full.lastIndexOf('/') + 1);
 		if (IMAGE_EXT.includes(ext(name))) {
 			previewKind = 'image';
+			return;
+		}
+		// A PDF is handed to the browser's own viewer whatever its size: the frame
+		// fetches it, and the viewer pages through it without us reading a byte.
+		if (isPdfPath(name)) {
+			previewKind = 'pdf';
 			return;
 		}
 		if (size != null && size > TEXT_PREVIEW_MAX) {
@@ -229,6 +260,13 @@
 				previewKind = 'missing';
 				return;
 			}
+			// An extensionless PDF (agents do write those) reads as mojibake in the
+			// text pane; its magic number says what it really is, and the server
+			// already sniffed the same bytes into a PDF content type.
+			if (text.startsWith(PDF_MAGIC)) {
+				previewKind = 'pdf';
+				return;
+			}
 			previewText = text;
 			previewKind = MD_EXT.includes(ext(name)) ? 'markdown' : 'text';
 		} catch {
@@ -237,15 +275,19 @@
 		}
 	}
 
+	// Kinds the BROWSER fetches for us, straight from rawUrl (an <img> / a PDF
+	// frame), rather than kinds we fetch and render as text.
+	const embedsRawUrl = $derived(previewKind === 'image' || previewKind === 'pdf');
+
 	// Reload the currently-previewed file's content (toolbar refresh). Re-fetches
-	// text/markdown; for images bumps reloadTick so the cache-busted rawUrl forces
-	// the <img> to re-request. Passing size=null skips the size-cap re-check
-	// (already passed on first open).
+	// text/markdown; for an embedded kind, bumping reloadTick is enough — the
+	// cache-busted rawUrl makes the element re-request. Passing size=null skips the
+	// size-cap re-check (already passed on first open).
 	function reloadPreview() {
 		if (!selected) return;
 		reloadTick = Date.now();
-		if (previewKind !== 'image') {
-			void previewPath(selected, null);
+		if (!embedsRawUrl) {
+			void previewPath(selected, null, 'click', previewAnchor);
 		}
 	}
 
@@ -275,12 +317,14 @@
 	// Deep-select a file by full subpath: browse to its parent dir and preview it.
 	// Shared by the initialFile effect (mount-time seed), the exported openFile
 	// (imperative re-open from the host, e.g. a repeat artifact-pill click) and
-	// relative links inside a markdown preview.
+	// relative links inside a markdown preview. `f` may carry a #anchor
+	// (`paper.pdf#page=7`), which addresses a place INSIDE the file, not a file.
 	function deepSelect(f: string, via: NavVia = 'click') {
 		if (!f) return;
-		const slash = f.lastIndexOf('/');
-		path = slash < 0 ? '' : f.slice(0, slash);
-		void previewPath(f, null, via);
+		const { path: file, anchor } = splitAnchor(f);
+		const slash = file.lastIndexOf('/');
+		path = slash < 0 ? '' : file.slice(0, slash);
+		void previewPath(file, null, via, anchor);
 	}
 
 	// Click a search result: deep-select the file (browse to its dir + preview).
@@ -448,7 +492,9 @@
 	// Full-page URL for the Expand affordance, deep-linked to the current file so a
 	// native middle-/cmd-click opens exactly what's showing in a new tab.
 	const expandHref = $derived(
-		expandBase ? expandBase + (selected ? `?file=${encodeURIComponent(selected)}` : '') : ''
+		expandBase
+			? expandBase + (selected ? `?file=${encodeURIComponent(selected)}${previewAnchor}` : '')
+			: ''
 	);
 
 	// Left-click on the Expand anchor: keep it in-app (SPA nav via onExpand) unless
@@ -459,7 +505,7 @@
 			return;
 		}
 		e.preventDefault();
-		onExpand?.(selected);
+		onExpand?.(selected ? selected + previewAnchor : '');
 	}
 
 	async function copy(what: 'content' | 'path') {
@@ -521,6 +567,12 @@
 		if (browser) localStorage.setItem(LIST_W_KEY, String(Math.round(listW)));
 	}
 </script>
+
+<!-- Row icon for a file: PDFs get their own glyph so they're spottable in a
+     long listing (they preview differently from every other file here). -->
+{#snippet fileIcon(name: string)}
+	{#if isPdfPath(name)}<FilePdfIcon size={16} />{:else}<FileIcon size={16} />{/if}
+{/snippet}
 
 <!-- The browser is keyboard-navigable (Up/Down step through the file list), so it
      takes focus and a keydown handler. It's a container region, not a single
@@ -607,7 +659,7 @@
 						onclick={() => openSearchResult(f.path)}
 						title={f.path}
 					>
-						<span class="ic"><FileIcon size={16} /></span>
+						<span class="ic">{@render fileIcon(f.path)}</span>
 						<span class="name path">
 							{#if f.path.includes('/')}<span class="dir">{f.path.slice(0, f.path.lastIndexOf('/') + 1)}</span>{/if}<span class="base">{f.path.slice(f.path.lastIndexOf('/') + 1)}</span>
 						</span>
@@ -627,7 +679,7 @@
 					onclick={() => openEntry(e)}
 				>
 					<span class="ic">
-						{#if e.is_dir}<FolderIcon size={16} weight="fill" />{:else}<FileIcon size={16} />{/if}
+						{#if e.is_dir}<FolderIcon size={16} weight="fill" />{:else}{@render fileIcon(e.name)}{/if}
 					</span>
 					<span class="name">{e.name}{e.is_dir ? '/' : ''}</span>
 					<span class="meta dim small">{e.is_dir ? '' : fmtSize(e.size)}</span>
@@ -680,9 +732,20 @@
 					</a>
 				</div>
 			</div>
-			<div class="pbody">
+			<!-- A PDF brings its own scrolling viewer, so the body stops padding and
+			     scrolling and just hands it the pane. -->
+			<div class="pbody" class:fill={previewKind === 'pdf'}>
 				{#if previewKind === 'image'}
 					<img src={rawUrl} alt={selected} />
+				{:else if previewKind === 'pdf'}
+					<!-- The browser's built-in PDF viewer (pages, zoom, find, print), fed
+					     by the raw endpoint — which serves PDFs inline under a sandbox CSP
+					     (see handleArtifactRaw). Keyed on rawUrl so switching files (or a
+					     Reload, which cache-busts it) rebuilds the frame instead of leaving
+					     the previous document's scroll position and zoom behind. -->
+					{#key rawUrl}
+						<iframe class="pdf" src={rawUrl} title={selected}></iframe>
+					{/key}
 				{:else if previewKind === 'markdown'}
 					<!-- Authored .md files soft-wrap at ~80 cols; render with standard
 					     paragraph reflow (breaks:false) so source wraps aren't hard <br>s.
@@ -1015,6 +1078,23 @@
 		padding: 0.6rem 0.7rem;
 		overflow: auto;
 		min-height: 0;
+	}
+	/* A self-scrolling preview (the PDF frame) takes the whole pane, edge to edge. */
+	.pbody.fill {
+		flex: 1 1 auto;
+		padding: 0;
+		overflow: hidden;
+	}
+	/* Fills .pbody.fill wherever that has a definite height (both split columns
+	   and the chat aside); min-height is the floor for the top-down layout, where
+	   the pane is content-sized and a percentage height resolves to auto. */
+	.preview iframe.pdf {
+		display: block;
+		width: 100%;
+		height: 100%;
+		min-height: min(28rem, 70vh);
+		border: none;
+		background: var(--bg-elev);
 	}
 	.preview img {
 		max-width: 100%;
