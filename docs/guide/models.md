@@ -158,7 +158,7 @@ never validated: the server is the authority on what it accepts.
 | `profile` | `openai` if `base_url` is the default, else `generic` | preset for the two knobs below |
 | `max_tokens_field` | per profile | `max_tokens` vs `max_completion_tokens` |
 | `stream_usage` | per profile | send `stream_options.include_usage` |
-| `capture_extras` | `false` | keep non-standard reasoning containers on the response's `ProviderExtra` (not replayed; see below) |
+| `capture_extras` | `false` | persist and replay non-standard per-tool extension fields (for example Gemini thought signatures in `extra_content` or LiteLLM `provider_specific_fields`); also retain message-level `provider_specific_fields` and `extra_content` for inspection |
 | `max_tokens` | 65536 | output cap. Accepted by **every** provider (handled centrally), and written into whichever field the profile selects — so it can no longer collide with `max_completion_tokens` |
 
 ### Profiles
@@ -196,13 +196,15 @@ max_tokens=4096           →  overrides the default output cap
 
 ### Known limits
 
-- **Thinking/reasoning is displayed, not replayed.** Reasoning text is read from
-  `reasoning_content` or `reasoning` into the agent's Thoughts, but the
-  provider-specific *signatures* are not echoed back on later turns (contrast
-  the native `vertex-claude` / `vertex-gemini` paths, which do replay them).
-  Expect slightly weaker multi-turn tool use from thinking models through this
-  provider. `capture_extras=true` persists the containers for a future replay
-  implementation.
+- **Reasoning text is displayed, not replayed.** Text from `reasoning_content`
+  or `reasoning` is surfaced as the agent's Thoughts, but is not echoed back as
+  an assistant reasoning field on later turns. Opaque per-tool metadata needed
+  for reasoning continuity *can* be preserved: `capture_extras=true` captures
+  fields such as Google Gemini `extra_content.google.thought_signature` and
+  LiteLLM `provider_specific_fields.thought_signature`, then replays them on the
+  corresponding tool call after persistence. The native `vertex-claude` /
+  `vertex-gemini` paths continue to handle their richer reasoning state
+  natively.
 - **Images on tool results** are re-emitted as a following `user` turn, because
   a `tool` message must carry a plain string.
 - **Azure OpenAI is not supported here** — it needs `api-version`, an `api-key`

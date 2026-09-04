@@ -28,6 +28,7 @@ import (
 	"amplio/internal/cli"
 	"amplio/internal/config"
 	"amplio/internal/db"
+	"amplio/internal/event"
 	"amplio/internal/llm"
 	amlog "amplio/internal/log"
 	"amplio/internal/observer"
@@ -51,6 +52,7 @@ var (
 	flagSystemLLMFast string
 	flagEmbedModel    string
 	flagSkillDirs     []string
+	flagLessonSearch  bool
 )
 
 // resolveConfig loads + layers the effective Config for a run-hosting command.
@@ -69,7 +71,19 @@ func resolveConfigRaw(cmd *cobra.Command) (config.Config, error) {
 		EmbedModel:    flagEmbedModel,
 		SkillDirs:     flagSkillDirs,
 		SkillDirsSet:  cmd.Flags().Changed("skill-dir"),
+		LessonSearch:  lessonSearchOverride(cmd),
 	})
+}
+
+// lessonSearchOverride returns the --lesson-search value only when the flag was
+// actually passed; nil lets the env var / config key decide. Cobra gives a bool
+// flag a value either way, so "not passed" has to come from Changed.
+func lessonSearchOverride(cmd *cobra.Command) *bool {
+	if !cmd.Flags().Changed("lesson-search") {
+		return nil
+	}
+	v := flagLessonSearch
+	return &v
 }
 
 // shimName is the single-purpose entry point installed in <data-dir>/bin and
@@ -169,6 +183,9 @@ func main() {
 		"Embedding model for recall (env AMPLIO_EMBED_MODEL or config embed_model; empty disables recall)")
 	root.PersistentFlags().StringArrayVar(&flagSkillDirs, "skill-dir", nil,
 		"Skill source directory (repeatable; env AMPLIO_SKILL_DIRS path-list; or config [skills].dirs)")
+	root.PersistentFlags().BoolVar(&flagLessonSearch, "lesson-search", true,
+		"Let agents search lessons mined from past runs (env AMPLIO_LESSON_SEARCH or config [lessons].search). "+
+			"--lesson-search=false isolates runs from other runs' lessons; mining and scoring still happen")
 
 	root.AddCommand(serveCmd(), notifyCmd(), headlessCmd(), clientCmd())
 	if err := root.Execute(); err != nil {
@@ -363,9 +380,18 @@ func bindCLITools(cfg config.Config) {
 // buildManager wires a run manager and its commit notifier over a store. The
 // manager resolves each run's agent provider from its RunConfig.LLM via
 // createProvider, so different runs can use different models.
-func buildManager(store db.Store) *runtime.RunManager {
+func buildManager(store db.Store, extra ...db.CommitListener) *runtime.RunManager {
 	mgr := runtime.NewRunManager(store, createProvider, runtime.NewRunRegistry(), resolver.Wrap)
-	store.SetCommitListener(runtime.NewCommitNotifier(mgr.RunRegistry(), mgr.RespawnSession, mgr.SessionStatus))
+	// There is one commit listener, and the wake path owns it — so anything else
+	// that wants commits is composed in here rather than replacing it. Extras run
+	// AFTER the notifier and must not block: this is the write path.
+	notifier := runtime.NewCommitNotifier(mgr.RunRegistry(), mgr.RespawnSession, mgr.SessionStatus)
+	store.SetCommitListener(func(runID, sessionID string, evt event.Event) {
+		notifier(runID, sessionID, evt)
+		for _, fn := range extra {
+			fn(runID, sessionID, evt)
+		}
+	})
 	return mgr
 }
 

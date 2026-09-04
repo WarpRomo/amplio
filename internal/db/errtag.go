@@ -113,6 +113,17 @@ func (t *taggedStore) RunCounts(ctx context.Context) (RunCounts, error) {
 	return c, tag(err)
 }
 
+// --- Response rewrites ---
+
+func (t *taggedStore) PutResponseRewrite(ctx context.Context, rw ResponseRewriteRecord) error {
+	return tag(t.s.PutResponseRewrite(ctx, rw))
+}
+
+func (t *taggedStore) ListResponseRewrites(ctx context.Context, runID, sessionID string) (map[int]ResponseRewriteRecord, error) {
+	m, err := t.s.ListResponseRewrites(ctx, runID, sessionID)
+	return m, tag(err)
+}
+
 // --- Custom model menu ---
 
 func (t *taggedStore) ListCustomModels(ctx context.Context) ([]string, error) {

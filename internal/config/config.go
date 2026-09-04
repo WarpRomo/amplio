@@ -44,9 +44,10 @@ const (
 	EnvSystemLLMHQ   = "AMPLIO_SYSTEM_LLM_HQ"
 	EnvSystemLLMFast = "AMPLIO_SYSTEM_LLM_FAST"
 	EnvEmbedModel    = "AMPLIO_EMBED_MODEL"
-	EnvSkillDirs     = "AMPLIO_SKILL_DIRS" // OS path-list separated (filepath.SplitList)
-	EnvSessionID     = "AMPLIO_SESSION_ID" // bash subprocess: the agent's own session (notify default target)
-	EnvNotify        = "AMPLIO_NOTIFY"     // DEPRECATED: the whole binary, kept for scripts/agents already using it
+	EnvSkillDirs     = "AMPLIO_SKILL_DIRS"    // OS path-list separated (filepath.SplitList)
+	EnvLessonSearch  = "AMPLIO_LESSON_SEARCH" // boolean; false = agents can't search lessons
+	EnvSessionID     = "AMPLIO_SESSION_ID"    // bash subprocess: the agent's own session (notify default target)
+	EnvNotify        = "AMPLIO_NOTIFY"        // DEPRECATED: the whole binary, kept for scripts/agents already using it
 )
 
 // --- Data directories ---

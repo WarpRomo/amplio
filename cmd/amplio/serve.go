@@ -136,7 +136,16 @@ func executeServe(cfg config.Config, listenOverride, lendOverride string) error 
 	// Shared, run-independent system: DB, manager, recall, observer (with a live
 	// report trigger), finalizer, title generator. serve is the only mode with a
 	// broadcaster and live reports.
-	sysEnv, err := setupSystem(ctx, cfg, systemOpts{broadcaster: bc, liveReports: true})
+	sysEnv, err := setupSystem(ctx, cfg, systemOpts{
+		broadcaster: bc,
+		liveReports: true,
+		// Reuse the ordinary session bump: the page already refetches its feed on
+		// it, and a rewrite is one more reason the feed changed.
+		rewriteNotify: func(runID, sessionID string) {
+			bus.Publish(eventstream.RunEvent{
+				Kind: eventstream.KindSessionBump, RunID: runID, SessionID: sessionID})
+		},
+	})
 	if err != nil {
 		return err
 	}

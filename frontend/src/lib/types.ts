@@ -123,6 +123,9 @@ export interface ChatBubble {
   step: number;
   created_at: string;
   tool_calls: ChatToolCall[];
+  // Plain-prose restatement of `content`, when the run's model opted in
+  // (see internal/responserewrite). Absent is normal: show the original.
+  rewrite?: string;
 }
 
 export interface PhaseCard {

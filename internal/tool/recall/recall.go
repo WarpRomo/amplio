@@ -47,8 +47,18 @@ const (
 	initialRecallHits = 5
 )
 
-func skillReady(ix *skills.Index) bool   { return ix != nil && ix.IsBuilt() }
-func lessonReady(ix *lessons.Index) bool { return ix != nil && ix.IsBuilt() }
+func skillReady(ix *skills.Index) bool { return ix != nil && ix.IsBuilt() }
+
+// lessonReady gates every agent-facing use of the lesson corpus: the search
+// tool, the lesson: branch of recall_load, and the run-start seed. An instance
+// started with lesson search off (see lessons.Index.DisableRecall) reads as
+// "no lesson corpus" here while mining and scoring carry on elsewhere.
+func lessonReady(ix *lessons.Index) bool { return ix != nil && ix.IsBuilt() && !ix.RecallDisabled() }
+
+// lessonsOff distinguishes "switched off for this instance" from "not built
+// yet", which read the same to lessonReady but should not read the same to the
+// operator or the model.
+func lessonsOff(ix *lessons.Index) bool { return ix != nil && ix.RecallDisabled() }
 
 type searchParams struct {
 	Query string `json:"query" jsonschema:"required" jsonschema_description:"Natural-language description of what you need to do"`
@@ -58,9 +68,15 @@ type searchParams struct {
 // Search returns the recall_search tool over the skill and lesson indexes
 // (either may be nil/unbuilt — that corpus is skipped).
 func Search(skillIx *skills.Index, lessonIx *lessons.Index) *tool.Tool {
+	// Describe only the corpora this instance will actually search: promising
+	// lessons that can never be returned would send the model looking for them.
+	corpora := "the skill library and the lessons mined from past runs"
+	if lessonsOff(lessonIx) {
+		corpora = "the skill library"
+	}
 	return &tool.Tool{
 		Name: "recall_search",
-		Description: "Search the skill library and the lessons mined from past runs for guides relevant to a task. " +
+		Description: "Search " + corpora + " for guides relevant to a task. " +
 			"Returns handles + previews; pass a handle to recall_load to read the full guide. Use this before attempting " +
 			"unfamiliar tools, internal systems, CLIs, or resource paths.",
 		ParamType: &searchParams{},
@@ -107,7 +123,11 @@ func Search(skillIx *skills.Index, lessonIx *lessons.Index) *tool.Tool {
 			}
 
 			if hitCount == 0 {
-				return &tool.Result{Content: fmt.Sprintf("No matching skills or lessons for %q.", p.Query)}, nil
+				what := "skills or lessons"
+				if lessonsOff(lessonIx) {
+					what = "skills"
+				}
+				return &tool.Result{Content: fmt.Sprintf("No matching %s for %q.", what, p.Query)}, nil
 			}
 			b.WriteString("\nLoad one with recall_load(handle=\"skill:<name>\" or \"lesson:<id>\").")
 			return &tool.Result{Content: b.String()}, nil
@@ -143,6 +163,12 @@ func Load(skillIx *skills.Index, lessonIx *lessons.Index) *tool.Tool {
 				return &tool.Result{Content: fmt.Sprintf("# Skill: %s\nPath: %s\n\n%s", e.Name, e.Path, e.Body)}, nil
 			}
 			if id, ok := strings.CutPrefix(handle, lessonPrefix); ok {
+				if lessonsOff(lessonIx) {
+					return &tool.Result{
+						Content: "Lesson recall is disabled on this instance; skills are still available.",
+						IsError: true,
+					}, nil
+				}
 				if !lessonReady(lessonIx) {
 					return &tool.Result{Content: "Lesson recall is unavailable.", IsError: true}, nil
 				}

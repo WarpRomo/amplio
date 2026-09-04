@@ -1863,3 +1863,104 @@ func TestServer_SessionTools(t *testing.T) {
 		t.Errorf("unknown session: %d, want 404", code)
 	}
 }
+
+// The chat feed carries a rewrite alongside the original, never instead of it,
+// and only when the stored rewrite belongs to THIS attempt at the step.
+func TestServer_ChatCarriesResponseRewrite(t *testing.T) {
+	t.Parallel()
+	srv, _, store := newTestServer(t)
+	ctx := context.Background()
+	if err := store.CreateRun(ctx, db.RunRecord{RunID: testRun}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession(ctx, db.SessionRecord{
+		RunID: testRun, SessionID: "chatty-bot", AgentType: "chatbot", Status: db.SessionIdle,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The conclusion sits at step 2, ABOVE the compaction boundary used below:
+	// compaction only rewrites the generation of events it carries (step >
+	// boundary), so a step-1 conclusion would make the check at the end vacuous.
+	for s := 1; s <= 2; s++ {
+		if _, err := store.AdvanceStep(ctx, testRun, "chatty-bot"); err != nil {
+			t.Fatal(err)
+		}
+		evs := []event.Event{&event.UserEvent{Content: "ask"}}
+		if s == 2 {
+			evs = []event.Event{&event.AssistantEvent{Content: "the original, densely written"}}
+		}
+		if err := store.FinalizeStep(ctx, testRun, "chatty-bot", s, evs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	feed := func() chatFeed {
+		t.Helper()
+		_, body := doReq(t, http.MethodGet, ts.URL+"/api/runs/"+testRun+"/sessions/chatty-bot/chat?token=secret", "")
+		var f chatFeed
+		if err := json.Unmarshal(body, &f); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	bubble := func(f chatFeed) chatBubble {
+		t.Helper()
+		for _, m := range f.Messages {
+			if m.Kind == "chatbot" {
+				return m
+			}
+		}
+		t.Fatal("no chatbot bubble")
+		return chatBubble{}
+	}
+
+	// Absent is the normal case: no rewrite, no toggle, original intact.
+	if got := bubble(feed()); got.Rewrite != "" {
+		t.Errorf("rewrite = %q before one is stored, want empty", got.Rewrite)
+	}
+
+	put := func(text string) {
+		t.Helper()
+		if err := store.PutResponseRewrite(ctx, db.ResponseRewriteRecord{
+			RunID: testRun, SessionID: "chatty-bot", Step: 2,
+			Model: "vertex-gemini:gemini-3.7-flash", Text: text,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("the plain version")
+	got := bubble(feed())
+	if got.Rewrite != "the plain version" {
+		t.Errorf("rewrite = %q", got.Rewrite)
+	}
+	if got.Content != "the original, densely written" {
+		t.Errorf("original was replaced: %q", got.Content)
+	}
+
+	// Compaction rewrites the generation of the events it carries forward. The
+	// rewrite is keyed by step alone precisely so it survives that; keying on
+	// generation would have made it vanish from every compacted chat.
+	if _, err := store.CompactContext(ctx, testRun, "chatty-bot", 1, "summary"); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	// Guard against this assertion going vacuous: the point is that the event's
+	// generation MOVED and the rewrite followed it anyway.
+	recs, err := store.GetEvents(ctx, testRun, "chatty-bot", db.EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := false
+	for _, r := range recs {
+		if r.Step == 2 && r.Generation > 0 {
+			moved = true
+		}
+	}
+	if !moved {
+		t.Fatal("compaction did not move the conclusion's generation; the test proves nothing")
+	}
+	if got := bubble(feed()); got.Rewrite != "the plain version" {
+		t.Errorf("rewrite lost after compaction: %q", got.Rewrite)
+	}
+}

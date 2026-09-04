@@ -47,6 +47,10 @@ type Index struct {
 	store    db.Store
 	embedder embed.Embedder
 
+	// recallDisabled turns off the agent-facing surface only (see
+	// DisableRecall). Set once at startup, before the index is shared.
+	recallDisabled bool
+
 	mu      sync.RWMutex
 	lessons map[string]db.LessonRecord
 	ids     []string    // row order
@@ -58,6 +62,21 @@ type Index struct {
 func NewIndex(store db.Store, embedder embed.Embedder) *Index {
 	return &Index{store: store, embedder: embedder}
 }
+
+// DisableRecall marks this index as unavailable to the AGENT-FACING recall
+// surface: recall_search stops searching lessons, recall_load refuses a
+// lesson: handle, and the run-start seed omits them. Everything else that uses
+// the index — end-of-run mining, its near-duplicate check, lesson scoring, and
+// the operator's /recall browse page — keeps working, because Search itself is
+// untouched. That split is the point: an isolated run must not READ what past
+// runs learned, while still CONTRIBUTING what it learns.
+//
+// Startup only, before the index is handed to the manager: read without
+// synchronization on the hot path.
+func (ix *Index) DisableRecall() { ix.recallDisabled = true }
+
+// RecallDisabled reports whether the agent-facing recall surface is off.
+func (ix *Index) RecallDisabled() bool { return ix.recallDisabled }
 
 // Embedder returns the index's embedder (used by mining to embed candidate
 // lessons with the same model the index searches against).

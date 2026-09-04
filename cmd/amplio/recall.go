@@ -144,9 +144,20 @@ func setupRecall(ctx context.Context, mgr *runtime.RunManager, store db.Store, c
 	// Lessons ("knowledge"): synchronous; reads from the DB, populated by
 	// end-of-run mining.
 	lessonIx := lessons.NewIndex(store, embedder)
-	if err := lessonIx.Build(ctx); err != nil {
+	// Instance-wide isolation switch. The index is still built and still handed
+	// to the manager: mining, its near-duplicate check and lesson scoring all
+	// need it. Only the agent-facing surface (recall_search / recall_load /
+	// the run-start seed) is closed off.
+	if !cfg.LessonSearchEnabled() {
+		lessonIx.DisableRecall()
+		slog.Info("lesson search disabled: agents cannot read lessons from past runs; mining and scoring still run")
+	}
+	switch err := lessonIx.Build(ctx); {
+	case err != nil:
 		st.knowledge = recallDisabled(fmt.Sprintf("index build failed: %s", err))
-	} else {
+	case !cfg.LessonSearchEnabled():
+		st.knowledge = recallDisabled("search off (--lesson-search=false); mining + scoring still run")
+	default:
 		st.knowledge = recallEnabled("")
 	}
 	mgr.SetLessonIndex(lessonIx)

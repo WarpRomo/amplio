@@ -36,9 +36,36 @@ not set, that sub-system will be disabled. Other useful configs:
 | `[run] llms` | — | the model menu offered for new runs; the first entry is the default |
 | `[skills] dirs` | built-in | skill source directories, layered in order |
 | `[skills] blocked` | — | skill names to exclude from every source |
+| `[lessons] search` | `true` | let agents search lessons mined from past runs (below) |
 | `[bridge.<name>]` | — | a named LLM bridge endpoint ([models](models.md)) |
+| `[response_rewrite]` | off | plain-prose restatement of chat conclusions (below) |
 
 Spec syntax for LLM models is in [models](models.md).
+
+### Rewriting chat conclusions
+
+An agent's closing message is written for speed, and it shows: long sentences,
+em-dash asides, shorthand. `[response_rewrite]` restates those messages in
+plainer prose and shows the result in the chat, with a per-message toggle back
+to the agent's own words. The original is always kept; the rewrite is a cache
+that can be deleted.
+
+```toml
+[response_rewrite]
+model = "vertex-gemini:gemini-3.7-flash"   # who does the rewriting
+for   = ["opus-5 · xhigh"]                 # which run models opt in
+# prompt = "…"                            # optional: replaces the built-in
+```
+
+**Opt-in per model, and off by default.** Whether a restatement helps depends on
+who wrote the original, so `for` lists the models whose runs get it — matched by
+full spec, `#nickname`, or the short label the UI shows, exactly as a bridge
+handle names a model. An empty `for` disables the feature.
+
+Only a chatbot session's **conclusions** are rewritten — the final message of a
+turn, not the intermediate tool-calling ones. Each costs one extra LLM call, and
+the work is fire-and-forget: a failure leaves the message with no toggle. The 
+rewrite will be generated async and update on the UI when generation completes.
 
 ## Config Precedence
 
@@ -83,6 +110,25 @@ Leave `embed_model` empty and amplio starts fine, reporting recall as disabled:
 
 Skills are re-scanned at startup, and their embeddings are cached in the
 database, so only new or changed files cost an embedding call.
+
+### Isolating runs from past lessons
+
+For a controlled experiment you may want runs that cannot inherit anything from
+earlier runs. Turn the lesson corpus off for the whole instance:
+
+```toml
+[lessons]
+search = false
+```
+
+or, per invocation:
+
+    amplio serve --lesson-search=false
+    AMPLIO_LESSON_SEARCH=0 amplio serve
+
+Lessons are still **mined** at the end of every run, and still browsable by you on the `/recall` page. 
+The instance keeps contributing to the corpus, it just stops reading from it. Skills are
+unaffected either way.
 
 ## The contents of the data directory
 

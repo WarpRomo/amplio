@@ -34,7 +34,8 @@ type chatChunk struct {
 			Content   content        `json:"content"`
 			ToolCalls []respToolCall `json:"tool_calls"`
 			reasoningFields
-			Extra map[string]json.RawMessage `json:"provider_specific_fields"`
+			Extra        map[string]json.RawMessage `json:"provider_specific_fields"`
+			ExtraContent map[string]json.RawMessage `json:"extra_content"`
 		} `json:"delta"`
 	} `json:"choices"`
 	Usage *apiUsage `json:"usage"`
@@ -55,20 +56,22 @@ type chatChunk struct {
 type accumulator struct {
 	text     strings.Builder
 	thoughts strings.Builder
-	// byIndex maps a tool call's stream index to its original slot in `calls`.
+	// byIndex maps each unambiguous stream index to a stable slot in `calls`.
 	// byID disambiguates compatibility servers that reuse an index for distinct
-	// parallel calls. Duplicate IDs must not retarget byIndex: ID-less
-	// continuations still belong to the original index slot. `index` is optional
-	// in the wire format; absent means 0.
-	byIndex    map[int]int
-	byID       map[string]int
-	calls      []llm.ToolCall
-	args       []*strings.Builder
-	stop       string
-	usage      llm.Usage
-	hasUsage   bool
-	extra      map[string]json.RawMessage
-	captureExt bool
+	// parallel calls. A duplicate index never retargets an existing byIndex entry;
+	// a known ID may populate an index only when that index is still unmapped.
+	// `index` is optional in the wire format; absent means 0.
+	byIndex      map[int]int
+	byID         map[string]int
+	calls        []llm.ToolCall
+	args         []*strings.Builder
+	callExtras   []toolCallExtraFields
+	stop         string
+	usage        llm.Usage
+	hasUsage     bool
+	extra        map[string]json.RawMessage
+	extraContent map[string]json.RawMessage
+	captureExt   bool
 }
 
 func newAccumulator(captureExtras bool) *accumulator {
@@ -108,6 +111,14 @@ func (a *accumulator) add(c *chatChunk) []llm.StreamEvent {
 				a.extra[k] = v
 			}
 		}
+		if a.captureExt && len(d.ExtraContent) > 0 {
+			if a.extraContent == nil {
+				a.extraContent = map[string]json.RawMessage{}
+			}
+			for k, v := range d.ExtraContent {
+				a.extraContent[k] = v
+			}
+		}
 		for _, tc := range d.ToolCalls {
 			events = append(events, a.addToolCall(tc)...)
 		}
@@ -124,13 +135,15 @@ func (a *accumulator) addToolCall(tc respToolCall) []llm.StreamEvent {
 	slot, seen := indexSlot, indexSeen
 	if tc.ID != "" {
 		if idSlot, ok := a.byID[tc.ID]; ok {
-			// A stable server ID wins over a bad/reused index without changing
-			// the canonical index route used by ID-less continuations.
+			// A stable ID wins over a bad/reused index. An unseen index can
+			// safely learn this slot; an existing mapping must never be retargeted.
 			slot, seen = idSlot, true
+			if !indexSeen {
+				a.byIndex[idx] = slot
+			}
 		} else if seen {
-			// If this slot already has a server-provided ID, a different ID at
-			// the same index is a distinct call. Some compatibility layers have
-			// been observed to emit index=0 for every parallel tool call.
+			// A different stable ID at an already-mapped index is a distinct
+			// parallel call. Keep the canonical index route on the original slot.
 			if existing := a.calls[slot].ID; existing != "" {
 				if existingSlot, ok := a.byID[existing]; ok && existingSlot == slot {
 					seen = false
@@ -145,6 +158,7 @@ func (a *accumulator) addToolCall(tc respToolCall) []llm.StreamEvent {
 		}
 		a.calls = append(a.calls, llm.ToolCall{ID: toolCallID(tc.ID, idx), Name: tc.Function.Name})
 		a.args = append(a.args, &strings.Builder{})
+		a.callExtras = append(a.callExtras, toolCallExtraFields{})
 	}
 	// A later frame may still be the one carrying id/name (servers vary on
 	// whether the first frame for an index has them), so fill any gap.
@@ -154,6 +168,9 @@ func (a *accumulator) addToolCall(tc respToolCall) []llm.StreamEvent {
 	if tc.ID != "" {
 		a.calls[slot].ID = tc.ID
 		a.byID[tc.ID] = slot
+	}
+	if a.captureExt {
+		a.callExtras[slot].merge(tc)
 	}
 
 	var events []llm.StreamEvent
@@ -183,10 +200,33 @@ func (a *accumulator) response() *llm.Response {
 		c.Arguments = a.args[i].String()
 		out.ToolCalls = append(out.ToolCalls, c)
 	}
+	extra := map[string]any{}
 	if len(a.extra) > 0 {
 		if blob, err := json.Marshal(a.extra); err == nil {
-			out.ProviderExtra = map[string]any{"openai.provider_specific_fields": string(blob)}
+			extra[providerSpecificFieldsKey] = string(blob)
 		}
+	}
+	if len(a.extraContent) > 0 {
+		if blob, err := json.Marshal(a.extraContent); err == nil {
+			extra[messageExtraContentKey] = string(blob)
+		}
+	}
+	if a.captureExt {
+		hasAny := false
+		for _, fields := range a.callExtras {
+			if !fields.empty() {
+				hasAny = true
+				break
+			}
+		}
+		if hasAny {
+			if blob, err := json.Marshal(a.callExtras); err == nil {
+				extra[toolCallExtraFieldsKey] = string(blob)
+			}
+		}
+	}
+	if len(extra) > 0 {
+		out.ProviderExtra = extra
 	}
 	return out
 }
