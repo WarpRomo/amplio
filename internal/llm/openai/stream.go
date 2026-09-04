@@ -56,9 +56,13 @@ type chatChunk struct {
 type accumulator struct {
 	text     strings.Builder
 	thoughts strings.Builder
-	// byIndex maps a tool call's stream index to its slot in `calls`. `index` is
-	// optional in the wire format; absent means 0.
+	// byIndex maps each unambiguous stream index to a stable slot in `calls`.
+	// byID disambiguates compatibility servers that reuse an index for distinct
+	// parallel calls. A duplicate index never retargets an existing byIndex entry;
+	// a known ID may populate an index only when that index is still unmapped.
+	// `index` is optional in the wire format; absent means 0.
 	byIndex      map[int]int
+	byID         map[string]int
 	calls        []llm.ToolCall
 	args         []*strings.Builder
 	callExtras   []toolCallExtraFields
@@ -71,7 +75,11 @@ type accumulator struct {
 }
 
 func newAccumulator(captureExtras bool) *accumulator {
-	return &accumulator{byIndex: map[int]int{}, captureExt: captureExtras}
+	return &accumulator{
+		byIndex:    map[int]int{},
+		byID:       map[string]int{},
+		captureExt: captureExtras,
+	}
 }
 
 // add folds one frame in and reports the incremental events it produced (for
@@ -123,10 +131,31 @@ func (a *accumulator) addToolCall(tc respToolCall) []llm.StreamEvent {
 	if tc.Index != nil {
 		idx = *tc.Index
 	}
-	slot, seen := a.byIndex[idx]
+	indexSlot, indexSeen := a.byIndex[idx]
+	slot, seen := indexSlot, indexSeen
+	if tc.ID != "" {
+		if idSlot, ok := a.byID[tc.ID]; ok {
+			// A stable ID wins over a bad/reused index. An unseen index can
+			// safely learn this slot; an existing mapping must never be retargeted.
+			slot, seen = idSlot, true
+			if !indexSeen {
+				a.byIndex[idx] = slot
+			}
+		} else if seen {
+			// A different stable ID at an already-mapped index is a distinct
+			// parallel call. Keep the canonical index route on the original slot.
+			if existing := a.calls[slot].ID; existing != "" {
+				if existingSlot, ok := a.byID[existing]; ok && existingSlot == slot {
+					seen = false
+				}
+			}
+		}
+	}
 	if !seen {
 		slot = len(a.calls)
-		a.byIndex[idx] = slot
+		if !indexSeen {
+			a.byIndex[idx] = slot
+		}
 		a.calls = append(a.calls, llm.ToolCall{ID: toolCallID(tc.ID, idx), Name: tc.Function.Name})
 		a.args = append(a.args, &strings.Builder{})
 		a.callExtras = append(a.callExtras, toolCallExtraFields{})
@@ -138,6 +167,7 @@ func (a *accumulator) addToolCall(tc respToolCall) []llm.StreamEvent {
 	}
 	if tc.ID != "" {
 		a.calls[slot].ID = tc.ID
+		a.byID[tc.ID] = slot
 	}
 	if a.captureExt {
 		a.callExtras[slot].merge(tc)
