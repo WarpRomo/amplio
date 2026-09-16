@@ -743,8 +743,18 @@ func (a *EventLoopAgent) loop(ctx context.Context, needsAdvance bool) error {
 		// always processes what's queued. So e.g. a child_result(crashed) that
 		// lands as we're about to conclude pulls us back for one more turn to see
 		// it, which is intended.
-		nextStepCount, _ := a.env.Store.GetEventCount(ctx, a.env.RunID, a.cfg.SessionID,
+		nextStepCount, err := a.env.Store.GetEventCount(ctx, a.env.RunID, a.cfg.SessionID,
 			db.EventFilter{StartStep: &newStep})
+		if err != nil {
+			// A failed count is NOT a count of zero. Concluding here is terminal
+			// and unrecoverable (db.IsSpine excludes concluded, so RecoverRun
+			// skips the session), so an unreadable queue must never be treated as
+			// an empty one. recordFailure already routes both reachable causes
+			// correctly: a cancelled ctx (shutdown/cancel) returns without
+			// writing, leaving the status for recovery, and a db.ErrStore error
+			// leaves the session ongoing-but-dead for Recover.
+			return a.recordFailure(ctx, fmt.Errorf("count events arrived during generation: %w", err))
+		}
 		if nextStepCount > 0 {
 			a.logger.Debug("events arrived during generation, continuing")
 			continue
